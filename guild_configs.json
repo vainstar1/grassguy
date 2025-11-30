@@ -1,0 +1,48 @@
+{
+  "1310720567221026869": {
+    "leaderboards": {
+      "ladder": {
+        "name": "Ladder",
+        "mode": {
+          "key": "score",
+          "target": 2
+        },
+        "leaderboard_channel_id": 1401759757055824045,
+        "leaderboard_message_id": 1426368567346991205,
+        "participant_role_id": 1403237820000112732,
+        "challenge_channel_id": 1401759757055824045,
+        "outgoing_channel_id": 1401759757055824045,
+        "announce_channel_id": 1401759757055824045,
+        "thread_cleanup_seconds": 21600
+      },
+      "all_bosses": {
+        "name": "all bosses",
+        "mode": {
+          "key": "score",
+          "target": 2
+        },
+        "leaderboard_channel_id": 1425010181112074310,
+        "leaderboard_message_id": 1426753592252956793,
+        "participant_role_id": 1403874608188358757,
+        "challenge_channel_id": 1425010181112074310,
+        "outgoing_channel_id": 1425010181112074310,
+        "announce_channel_id": 1425010181112074310,
+        "thread_cleanup_seconds": 21600
+      }
+    },
+    "category_modes": {
+      "ladder": {
+        "key": "score",
+        "target": 2
+      },
+      "all_bosses": {
+        "key": "score",
+        "target": 2
+      }
+    },
+    "categories": [
+      "Ladder",
+      "all bosses"
+    ]
+  }
+}
