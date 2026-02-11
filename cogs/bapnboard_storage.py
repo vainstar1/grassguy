@@ -105,6 +105,14 @@ class BoardStorage:
                     elo_change REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_matches_lookup ON matches (guild_id, category, user_id);
+                CREATE TABLE IF NOT EXISTS match_announcements (
+                    guild_id INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    winner_match_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, category, winner_match_id)
+                );
                 CREATE TABLE IF NOT EXISTS active_matches (
                     guild_id INTEGER NOT NULL,
                     category TEXT NOT NULL,
@@ -563,11 +571,11 @@ class BoardStorage:
         opponent_value: Optional[str],
         result: str,
         elo_change: float,
-    ) -> None:
+    ) -> int:
         safe = normalize_category(category)
         with self._lock:
             with self._connect() as conn:
-                conn.execute(
+                cur = conn.execute(
                     """
                     INSERT INTO matches (
                         guild_id,
@@ -596,6 +604,287 @@ class BoardStorage:
                         float(elo_change),
                     ),
                 )
+                return int(cur.lastrowid)
+
+    def load_raw_match_rows(self, guild_id: int, category: str) -> List[Dict[str, Any]]:
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
+                    FROM matches
+                    WHERE guild_id=? AND category=?
+                    ORDER BY recorded_at ASC, id ASC
+                    """,
+                    (guild_id, safe),
+                )
+                output: List[Dict[str, Any]] = []
+                for row in rows:
+                    output.append(
+                        {
+                            "id": int(row["id"]),
+                            "user_id": int(row["user_id"]),
+                            "recorded_at": row["recorded_at"],
+                            "opponent_id": int(row["opponent_id"]),
+                            "challenger": bool(row["challenger"]),
+                            "user_value": row["user_value"],
+                            "opponent_value": row["opponent_value"],
+                            "result": row["result"],
+                            "elo_change": float(row["elo_change"]),
+                        }
+                    )
+                return output
+
+    def load_recent_completed_matches(
+        self,
+        guild_id: int,
+        category: str,
+        limit: int = 25,
+    ) -> List[Dict[str, Any]]:
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        w.id AS winner_match_id,
+                        l.id AS loser_match_id,
+                        w.recorded_at AS recorded_at,
+                        w.user_id AS winner_id,
+                        w.opponent_id AS loser_id,
+                        w.user_value AS winner_value,
+                        w.opponent_value AS loser_value
+                    FROM matches w
+                    JOIN matches l
+                      ON l.guild_id = w.guild_id
+                     AND l.category = w.category
+                     AND l.recorded_at = w.recorded_at
+                     AND l.user_id = w.opponent_id
+                     AND l.opponent_id = w.user_id
+                     AND l.result = 'Loss'
+                    WHERE w.guild_id=?
+                      AND w.category=?
+                      AND w.result='Win'
+                    ORDER BY w.recorded_at DESC, w.id DESC
+                    LIMIT ?
+                    """,
+                    (guild_id, safe, max(1, int(limit))),
+                )
+                output: List[Dict[str, Any]] = []
+                for row in rows:
+                    output.append(
+                        {
+                            "winner_match_id": int(row["winner_match_id"]),
+                            "loser_match_id": int(row["loser_match_id"]),
+                            "recorded_at": row["recorded_at"],
+                            "winner_id": int(row["winner_id"]),
+                            "loser_id": int(row["loser_id"]),
+                            "winner_value": row["winner_value"],
+                            "loser_value": row["loser_value"],
+                        }
+                    )
+                return output
+
+    def load_recent_pair_matches(
+        self,
+        guild_id: int,
+        category: str,
+        player_a: int,
+        player_b: int,
+        limit: int = 25,
+    ) -> List[Dict[str, Any]]:
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        w.id AS winner_match_id,
+                        l.id AS loser_match_id,
+                        w.recorded_at AS recorded_at,
+                        w.user_id AS winner_id,
+                        w.opponent_id AS loser_id,
+                        w.user_value AS winner_value,
+                        w.opponent_value AS loser_value,
+                        w.elo_change AS winner_elo_change,
+                        l.elo_change AS loser_elo_change
+                    FROM matches w
+                    JOIN matches l
+                      ON l.guild_id = w.guild_id
+                     AND l.category = w.category
+                     AND l.recorded_at = w.recorded_at
+                     AND l.user_id = w.opponent_id
+                     AND l.opponent_id = w.user_id
+                     AND l.result = 'Loss'
+                    WHERE w.guild_id=?
+                      AND w.category=?
+                      AND w.result='Win'
+                      AND (
+                            (w.user_id=? AND w.opponent_id=?)
+                            OR
+                            (w.user_id=? AND w.opponent_id=?)
+                          )
+                    ORDER BY w.recorded_at DESC, w.id DESC
+                    LIMIT ?
+                    """,
+                    (guild_id, safe, player_a, player_b, player_b, player_a, max(1, int(limit))),
+                )
+                output: List[Dict[str, Any]] = []
+                for row in rows:
+                    output.append(
+                        {
+                            "winner_match_id": int(row["winner_match_id"]),
+                            "loser_match_id": int(row["loser_match_id"]),
+                            "recorded_at": row["recorded_at"],
+                            "winner_id": int(row["winner_id"]),
+                            "loser_id": int(row["loser_id"]),
+                            "winner_value": row["winner_value"],
+                            "loser_value": row["loser_value"],
+                            "winner_elo_change": float(row["winner_elo_change"]),
+                            "loser_elo_change": float(row["loser_elo_change"]),
+                        }
+                    )
+                return output
+
+    def load_match_pair_by_winner_row_id(
+        self,
+        guild_id: int,
+        category: str,
+        winner_row_id: int,
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                winner_row = conn.execute(
+                    """
+                    SELECT id, user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
+                    FROM matches
+                    WHERE guild_id=? AND category=? AND id=? AND result='Win'
+                    """,
+                    (guild_id, safe, int(winner_row_id)),
+                ).fetchone()
+                if winner_row is None:
+                    return None
+                loser_row = conn.execute(
+                    """
+                    SELECT id, user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
+                    FROM matches
+                    WHERE guild_id=?
+                      AND category=?
+                      AND recorded_at=?
+                      AND user_id=?
+                      AND opponent_id=?
+                      AND result='Loss'
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """,
+                    (
+                        guild_id,
+                        safe,
+                        winner_row["recorded_at"],
+                        int(winner_row["opponent_id"]),
+                        int(winner_row["user_id"]),
+                    ),
+                ).fetchone()
+                if loser_row is None:
+                    return None
+                return {
+                    "winner": {
+                        "id": int(winner_row["id"]),
+                        "user_id": int(winner_row["user_id"]),
+                        "recorded_at": winner_row["recorded_at"],
+                        "opponent_id": int(winner_row["opponent_id"]),
+                        "challenger": bool(winner_row["challenger"]),
+                        "user_value": winner_row["user_value"],
+                        "opponent_value": winner_row["opponent_value"],
+                        "result": winner_row["result"],
+                        "elo_change": float(winner_row["elo_change"]),
+                    },
+                    "loser": {
+                        "id": int(loser_row["id"]),
+                        "user_id": int(loser_row["user_id"]),
+                        "recorded_at": loser_row["recorded_at"],
+                        "opponent_id": int(loser_row["opponent_id"]),
+                        "challenger": bool(loser_row["challenger"]),
+                        "user_value": loser_row["user_value"],
+                        "opponent_value": loser_row["opponent_value"],
+                        "result": loser_row["result"],
+                        "elo_change": float(loser_row["elo_change"]),
+                    },
+                }
+
+    def update_match_rows(self, guild_id: int, category: str, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                for payload in rows:
+                    try:
+                        row_id = int(payload["id"])
+                        user_id = int(payload["user_id"])
+                        opponent_id = int(payload["opponent_id"])
+                    except Exception:
+                        continue
+                    cur.execute(
+                        """
+                        UPDATE matches
+                        SET
+                            user_id=?,
+                            opponent_id=?,
+                            challenger=?,
+                            user_value=?,
+                            opponent_value=?,
+                            result=?,
+                            elo_change=?
+                        WHERE guild_id=? AND category=? AND id=?
+                        """,
+                        (
+                            user_id,
+                            opponent_id,
+                            1 if payload.get("challenger") else 0,
+                            payload.get("user_value"),
+                            payload.get("opponent_value"),
+                            payload.get("result"),
+                            float(payload.get("elo_change", 0.0)),
+                            guild_id,
+                            safe,
+                            row_id,
+                        ),
+                    )
+
+    def save_match_announcement(self, guild_id: int, category: str, winner_match_id: int, channel_id: int, message_id: int) -> None:
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO match_announcements (guild_id, category, winner_match_id, channel_id, message_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(guild_id, category, winner_match_id) DO UPDATE SET
+                        channel_id=excluded.channel_id,
+                        message_id=excluded.message_id
+                    """,
+                    (guild_id, safe, int(winner_match_id), int(channel_id), int(message_id)),
+                )
+
+    def get_match_announcement(self, guild_id: int, category: str, winner_match_id: int) -> Optional[Dict[str, int]]:
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT channel_id, message_id
+                    FROM match_announcements
+                    WHERE guild_id=? AND category=? AND winner_match_id=?
+                    """,
+                    (guild_id, safe, int(winner_match_id)),
+                ).fetchone()
+                if row is None:
+                    return None
+                return {"channel_id": int(row["channel_id"]), "message_id": int(row["message_id"])}
 
     def load_match_history(self, guild_id: int, category: str) -> List[Dict[str, Any]]:
         safe = normalize_category(category)
@@ -825,6 +1114,10 @@ class BoardStorage:
                     (new_safe, guild_id, old_safe),
                 )
                 cur.execute(
+                    "UPDATE match_announcements SET category=? WHERE guild_id=? AND category=?",
+                    (new_safe, guild_id, old_safe),
+                )
+                cur.execute(
                     "UPDATE active_matches SET category=?, leaderboard=? WHERE guild_id=? AND category=?",
                     (new_category, new_safe, guild_id, old_category),
                 )
@@ -864,6 +1157,10 @@ class BoardStorage:
                 )
                 cur.execute(
                     "DELETE FROM matches WHERE guild_id=? AND category=?",
+                    (guild_id, safe),
+                )
+                cur.execute(
+                    "DELETE FROM match_announcements WHERE guild_id=? AND category=?",
                     (guild_id, safe),
                 )
                 cur.execute(

@@ -35,6 +35,8 @@ class PagedListView(discord.ui.View):
         footer_note: Optional[str] = None,
         thumbnail: Optional[str] = None,
         header: Optional[str] = None,
+        client_side_only: bool = False,
+        owner_id: Optional[int] = None,
     ):
         super().__init__(timeout=None)
         self.title = title
@@ -43,6 +45,8 @@ class PagedListView(discord.ui.View):
         self.footer_note = footer_note
         self.thumbnail = thumbnail
         self.header = header
+        self.client_side_only = client_side_only
+        self.owner_id = owner_id
         self.current = 0
         self.total_pages = max(1, len(self.pages))
         self._sync_buttons()
@@ -82,17 +86,35 @@ class PagedListView(discord.ui.View):
         if jump_button:
             jump_button.disabled = self.total_pages <= 1
 
+    async def _send_private_pager(self, interaction: discord.Interaction, index: int) -> None:
+        private_view = PagedListView(
+            title=self.title,
+            pages=self.pages,
+            color=self.color,
+            footer_note=self.footer_note,
+            thumbnail=self.thumbnail,
+            header=self.header,
+            client_side_only=False,
+            owner_id=interaction.user.id,
+        )
+        private_view.current = index
+        private_view._sync_buttons()
+        await interaction.response.send_message(embed=private_view.create_embed(), view=private_view, ephemeral=True)
+
     async def show_page(self, interaction: discord.Interaction, index: int) -> None:
         index = max(0, min(index, self.total_pages - 1))
+        if self.owner_id is not None and interaction.user.id != self.owner_id:
+            await interaction.response.send_message("This pager belongs to another user.", ephemeral=True)
+            return
+        if self.client_side_only and self.owner_id is None:
+            await self._send_private_pager(interaction, index)
+            return
         self.current = index
         self._sync_buttons()
         await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
     async def handle_jump(self, interaction: discord.Interaction, index: int) -> None:
-        index = max(0, min(index, self.total_pages - 1))
-        self.current = index
-        self._sync_buttons()
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        await self.show_page(interaction, index)
 
     @discord.ui.button(label="Back", style=discord.ButtonStyle.secondary, custom_id="bapn_lb_back")
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -215,12 +237,14 @@ class ChallengeControlView(discord.ui.View):
         if not match:
             self.accept_button.disabled = True
             self.cancel_button.disabled = True
+            self.decline_button.disabled = True
             return
         status = match.get("status", "open")
         opponent_id = match.get("opponent_id")
         if status in {"completed", "cancelled"}:
             self.accept_button.disabled = True
             self.cancel_button.disabled = True
+            self.decline_button.disabled = True
             return
         if opponent_id:
             self.accept_button.disabled = status != "pending"

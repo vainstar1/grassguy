@@ -58,10 +58,11 @@ class TranslateCog(commands.Cog):
     def to_machine_cipher(self, plain_text):
         translated_chars = []
         for char in plain_text:
-            lower_char = char.lower()
-            if lower_char in self.cipher_map:
-                translated_chars.append(self.cipher_map[lower_char])
-            else:
+            if char.isalpha():
+                lower_char = char.lower()
+                if lower_char in self.cipher_map:
+                    translated_chars.append(self.cipher_map[lower_char])
+            elif char.isspace():
                 translated_chars.append(char)
         return ''.join(translated_chars)
     

@@ -25,6 +25,11 @@ from .bapnboard_shared import (
 from .bapnboard_storage import BoardStorage
 from .bapnboard_views import ChallengeControlView, PagedListView, ProfileView
 
+OVERRIDE_MODE_CHOICES = [
+    app_commands.Choice(name="Completed Match", value="completed"),
+    app_commands.Choice(name="Ongoing Match", value="ongoing"),
+]
+
 
 async def category_autocomplete(interaction: discord.Interaction, current: str):
     if interaction.guild is None:
@@ -84,6 +89,19 @@ async def scope_autocomplete(interaction: discord.Interaction, current: str):
     if not matches:
         matches = options
     return [app_commands.Choice(name=opt, value=opt.lower()) for opt in matches[:25]]
+
+async def override_match_autocomplete(interaction: discord.Interaction, current: str):
+    cog = interaction.client.get_cog("LeaderboardCog")
+    if cog is None:
+        return []
+    return await cog.override_match_autocomplete(interaction, current)
+
+
+async def override_active_match_autocomplete(interaction: discord.Interaction, current: str):
+    cog = interaction.client.get_cog("LeaderboardCog")
+    if cog is None:
+        return []
+    return await cog.override_active_match_autocomplete(interaction, current)
 
 class LeaderboardCog(commands.Cog):
     leaderboard = app_commands.Group(name="leaderboard", description="Leaderboard commands", guild_only=True)
@@ -307,7 +325,7 @@ class LeaderboardCog(commands.Cog):
         meta_snapshot = copy.deepcopy(self.players_meta.get(gid_s, {}))
         await asyncio.to_thread(self.storage.save_player_meta, guild_id, meta_snapshot)
 
-    async def save_match_for(self, gid: int, category: str, user_id: int, date: datetime, opponent_id: int, challenger: bool, time_user, time_opp, result: str, elo_change: float = 0.0):
+    async def save_match_for(self, gid: int, category: str, user_id: int, date: datetime, opponent_id: int, challenger: bool, time_user, time_opp, result: str, elo_change: float = 0.0) -> int:
         if isinstance(time_user, str):
             t_user_field = time_user
         else:
@@ -322,7 +340,7 @@ class LeaderboardCog(commands.Cog):
                 t_opp_field = f"{float(time_opp):.3f}"
             except Exception:
                 t_opp_field = "0.000"
-        await asyncio.to_thread(
+        return await asyncio.to_thread(
             self.storage.append_match,
             gid,
             category,
@@ -335,6 +353,113 @@ class LeaderboardCog(commands.Cog):
             result,
             elo_change,
         )
+
+    def _coerce_member_id(self, value: Any) -> Optional[int]:
+        if isinstance(value, (discord.Member, discord.User)):
+            return value.id
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
+
+    def _coerce_override_mode(self, value: Any) -> Optional[str]:
+        if isinstance(value, app_commands.Choice):
+            return str(value.value).strip().lower()
+        if isinstance(value, str):
+            return value.strip().lower()
+        return None
+
+    async def override_match_autocomplete(self, interaction: discord.Interaction, current: str):
+        if interaction.guild is None:
+            return []
+        category = getattr(interaction.namespace, "category", None)
+        mode_raw = getattr(interaction.namespace, "mode", None)
+        mode = self._coerce_override_mode(mode_raw)
+        if not category or mode != "completed":
+            return []
+        try:
+            rows = await asyncio.to_thread(
+                self.storage.load_recent_completed_matches,
+                interaction.guild.id,
+                category,
+                25,
+            )
+        except Exception:
+            return []
+        mode_info = self.get_category_mode(interaction.guild.id, category)
+        lowered = (current or "").lower().strip()
+        choices: List[app_commands.Choice[str]] = []
+        for row in rows:
+            recorded_raw = row.get("recorded_at")
+            try:
+                recorded_dt = datetime.fromisoformat(str(recorded_raw))
+                if recorded_dt.tzinfo is None:
+                    recorded_dt = recorded_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                recorded_dt = datetime.now(timezone.utc)
+            stamp = recorded_dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+            winner_label = self.user_snapshot_name_for(interaction.guild.id, int(row["winner_id"]))
+            loser_label = self.user_snapshot_name_for(interaction.guild.id, int(row["loser_id"]))
+            if mode_info["type"] == "time":
+                detail = f"{row.get('winner_value', '?')} vs {row.get('loser_value', '?')}"
+            else:
+                detail = f"{row.get('winner_value', '?')}-{row.get('loser_value', '?')}"
+            label = f"{winner_label} vs {loser_label} | {stamp} | {detail}"
+            if lowered and lowered not in label.lower():
+                continue
+            trimmed = label[:100]
+            choices.append(app_commands.Choice(name=trimmed, value=str(row["winner_match_id"])))
+            if len(choices) >= 25:
+                break
+        return choices
+
+    async def override_active_match_autocomplete(self, interaction: discord.Interaction, current: str):
+        if interaction.guild is None:
+            return []
+        category = getattr(interaction.namespace, "category", None)
+        mode_raw = getattr(interaction.namespace, "mode", None)
+        mode = self._coerce_override_mode(mode_raw)
+        if not category or mode != "ongoing":
+            return []
+        bucket = self.get_active_bucket(interaction.guild.id, category)
+        matches = bucket.get("matches", {})
+        lowered = (current or "").lower().strip()
+        allowed_statuses = {"awaiting_result", "pending_cancel", "disputed", "active"}
+        sortable_rows: List[Tuple[datetime, str, int, int, str]] = []
+        for match_id, match in matches.items():
+            status = str(match.get("status") or "open")
+            if status not in allowed_statuses:
+                continue
+            challenger_id = self._coerce_member_id(match.get("challenger_id"))
+            opponent_id = self._coerce_member_id(match.get("opponent_id"))
+            if challenger_id is None or opponent_id is None:
+                continue
+            created_raw = str(match.get("created_at") or "")
+            try:
+                created_dt = datetime.fromisoformat(created_raw)
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                created_dt = datetime.now(timezone.utc)
+            sortable_rows.append((created_dt, match_id, challenger_id, opponent_id, status))
+        sortable_rows.sort(key=lambda item: item[0], reverse=True)
+
+        choices: List[app_commands.Choice[str]] = []
+        for created_dt, match_id, challenger_id, opponent_id, status in sortable_rows:
+            stamp = created_dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+            challenger_label = self.user_snapshot_name_for(interaction.guild.id, challenger_id)
+            opponent_label = self.user_snapshot_name_for(interaction.guild.id, opponent_id)
+            label = f"{challenger_label} vs {opponent_label} | {status} | {stamp}"
+            if lowered and lowered not in label.lower():
+                continue
+            choices.append(app_commands.Choice(name=label[:100], value=str(match_id)))
+            if len(choices) >= 25:
+                break
+        return choices
 
     def format_match_entry(self, gid: int, category: str, row: Dict[str, Any], perspective_id: Optional[int] = None, include_category: bool = False) -> Optional[Tuple[datetime, str]]:
         try:
@@ -516,10 +641,22 @@ class LeaderboardCog(commands.Cog):
         perms = member.guild_permissions
         return perms.administrator or perms.manage_guild or perms.manage_roles or perms.manage_channels or perms.manage_messages
 
+    def find_match_by_thread(self, gid: int, thread_id: int) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+        cat_map = self.active_fights.get(str(gid), {})
+        for category, bucket in cat_map.items():
+            matches = bucket.get("matches", {})
+            for match_id, data in matches.items():
+                if data.get("thread_id") == thread_id:
+                    return category, match_id, data
+        return None
+
     def find_match_between(self, gid: int, category: str, player_a: int, player_b: int) -> Optional[Tuple[str, Dict[str, Any]]]:
         bucket = self.get_active_bucket(gid, category)
         matches = bucket.get("matches", {})
         for match_id, data in matches.items():
+            status = data.get("status", "open")
+            if status in {"completed", "cancelled"}:
+                continue
             participants = {data.get("challenger_id"), data.get("opponent_id")}
             if participants == {player_a, player_b}:
                 return match_id, data
@@ -623,31 +760,31 @@ class LeaderboardCog(commands.Cog):
     def compute_elo_change(self, mode_info: Any, elo_w: float, elo_l: float, winner_metric: float, loser_metric: float) -> float:
         info = self.normalize_mode_value(mode_info)
         expected = 1.0 / (1.0 + 10 ** ((elo_l - elo_w) / 400.0))
+
+        def clamp(value: float, lower: float, upper: float) -> float:
+            return max(lower, min(value, upper))
+
         if info["type"] == "time":
-            margin = max(0.0, loser_metric - winner_metric)
-            winner_time = max(winner_metric, 1e-3)
-            relative_margin = margin / winner_time
-            relative_scale = min(relative_margin / 0.10, 1.0)
-            absolute_scale = min(margin / 45.0, 1.0)
-            margin_scale = max(relative_scale, absolute_scale)
-            length_scale = min(180.0 / max(winner_time, 180.0), 1.0)
-            margin_multiplier = (0.2 + 0.8 * margin_scale) * (0.6 + 0.4 * length_scale)
-            base_k = 30.0
+            margin = loser_metric - winner_metric
+            relative_margin = margin / max(winner_metric, 1e-3)
+            relative_scale = clamp(relative_margin / 0.25, 0.0, 1.0)
+            absolute_scale = clamp(margin / 60.0, 0.0, 1.0)
+            margin_ratio = max(relative_scale, absolute_scale)
+            margin_multiplier = 1.0 + 0.45 * margin_ratio
+            base_k = 42.0
         else:
-            target = max(1.0, float(info.get("target") or 1))
-            diff = max(0.0, winner_metric - loser_metric)
-            relative_scale = min(diff / max(target, 1.0), 1.0)
-            absolute_scale = min(diff / max(target * 0.5, 1.0), 1.0)
-            margin_scale = max(relative_scale, absolute_scale)
-            margin_multiplier = 0.25 + 0.75 * margin_scale
-            base_k = 26.0
+            target = max(1.0, float(info.get("target") or 1.0))
+            margin_ratio = clamp((winner_metric - loser_metric) / target, 0.0, 1.0)
+            margin_multiplier = 1.0 + 0.50 * margin_ratio
+            base_k = 40.0
+
         if expected < 0.5:
-            swing_factor = 1.0 + (0.5 - expected) * 3.0
+            expect_mult = 1.0 + (0.5 - expected) * 0.6
         else:
-            swing_factor = 1.0 - (expected - 0.5) * 0.8
-        swing_factor = max(0.35, min(swing_factor, 2.75))
-        adjusted_k = base_k * margin_multiplier * swing_factor
-        return adjusted_k * (1.0 - expected)
+            expect_mult = 1.0 - (expected - 0.5) * 0.3
+        expect_mult = clamp(expect_mult, 0.85, 1.20)
+
+        return base_k * margin_multiplier * expect_mult * (1.0 - expected)
 
     @staticmethod
     def format_elo_delta(delta: float) -> str:
@@ -691,7 +828,13 @@ class LeaderboardCog(commands.Cog):
             lines.append(f"{prefix} **{name}** - Elo {data['elo']:.1f} | W:{data['wins']} L:{data['losses']} ({win_pct:.1f}%)")
         pages = chunk_list(lines, 10)
         footer = f"{len(sorted_players)} players"
-        return PagedListView(title=f"{category} Leaderboard", pages=pages, color=discord.Color.gold(), footer_note=footer)
+        return PagedListView(
+            title=f"{category} Leaderboard",
+            pages=pages,
+            color=discord.Color.gold(),
+            footer_note=footer,
+            client_side_only=True,
+        )
 
     def build_match_embed(self, guild: discord.Guild, category: str, match: Dict[str, Any]) -> discord.Embed:
         board_cfg = self.get_leaderboard_config(guild.id, category)
@@ -749,6 +892,9 @@ class LeaderboardCog(commands.Cog):
             extra += f"\nRank window +/-{rank_range}"
         embed.add_field(name="Format", value=extra, inline=False)
         embed.add_field(name="Status", value=status_text, inline=False)
+        cancel_reason = match.get("cancel_reason")
+        if status == "cancelled" and cancel_reason:
+            embed.add_field(name="Cancellation", value=str(cancel_reason), inline=False)
         submissions = match.get("submissions", {})
         if submissions:
             submission_lines = []
@@ -831,8 +977,6 @@ class LeaderboardCog(commands.Cog):
                 match.pop("thread_message_id", None)
                 return existing
         board_cfg = self.get_leaderboard_config(guild.id, category)
-        base_channel_id = board_cfg.get("challenge_channel_id") or message.channel.id
-        base_channel = guild.get_channel(base_channel_id) or message.channel
         challenger_id = match.get("challenger_id")
         opponent_id = match.get("opponent_id")
         challenger_member = guild.get_member(challenger_id) or self.client.get_user(challenger_id)
@@ -844,20 +988,20 @@ class LeaderboardCog(commands.Cog):
             thread_label += f" vs {opponent_name}"
         thread_label = thread_label[:90]
         try:
-            thread = await base_channel.create_thread(name=thread_label, type=discord.ChannelType.public_thread, message=message, auto_archive_duration=1440)
+            thread = await message.create_thread(name=thread_label, auto_archive_duration=1440)
         except Exception:
-            logger.exception("Failed to create thread for guild %s match %s", guild.id, match.get("id"))
-            return None
+            try:
+                thread = await message.channel.create_thread(
+                    name=thread_label,
+                    type=discord.ChannelType.public_thread,
+                    message=message,
+                    auto_archive_duration=1440,
+                )
+            except Exception:
+                logger.exception("Failed to create thread for guild %s match %s", guild.id, match.get("id"))
+                return None
         try:
-            await thread.set_permissions(guild.default_role, send_messages=False, add_reactions=False)
-            for role in guild.roles:
-                perms = role.permissions
-                if perms.administrator or perms.manage_guild or perms.manage_messages:
-                    await thread.set_permissions(role, send_messages=True, add_reactions=True)
-        except Exception:
-            logger.debug("Thread permission update failed for guild %s match %s", guild.id, match.get("id"))
-        try:
-            await thread.send("This thread tracks the match. Only moderators can speak here. Use /leaderboard commands to manage the result.")
+            await thread.send("This thread tracks the match. Only participants and moderators can speak here. Use /leaderboard commands to manage the result.")
             if opponent_id and challenger_id:
                 challenger_mention = challenger_member.mention if challenger_member else f"<@{challenger_id}>"
                 opponent_mention = opponent_member.mention if opponent_member else f"<@{opponent_id}>"
@@ -870,8 +1014,118 @@ class LeaderboardCog(commands.Cog):
         bucket = self.get_active_bucket(guild.id, category)
         bucket["matches"][match_id] = match
         await self.save_active_fights_for(guild.id)
-        await self.schedule_thread_deletion(guild.id, thread.id, category)
         return thread
+
+    async def _cancel_match_with_embed_update(self, guild_id: int, category: str, match_id: str, reason: Optional[str] = None) -> bool:
+        match = self.get_match(guild_id, category, match_id)
+        if not match:
+            return False
+        status = match.get("status", "open")
+        if status in {"completed", "cancelled"}:
+            return False
+        match["status"] = "cancelled"
+        match["cancel_votes"] = []
+        match["submissions"] = {}
+        match.pop("response_deadline", None)
+        if reason:
+            match["cancel_reason"] = reason
+        bucket = self.get_active_bucket(guild_id, category)
+        bucket["matches"][match_id] = match
+        await self.save_active_fights_for(guild_id)
+        await self.refresh_match_message(guild_id, category, match_id)
+        thread_id = match.get("thread_id")
+        if thread_id:
+            await self.schedule_thread_deletion(guild_id, thread_id, category)
+        return True
+
+    async def _resolve_departed_member_matches(self, guild: discord.Guild, departed_user_id: int, source: str):
+        gid = guild.id
+        cat_map = self.active_fights.get(str(gid), {})
+        if not cat_map:
+            return
+        for category, bucket in list(cat_map.items()):
+            matches = bucket.get("matches", {})
+            for match_id, match in list(matches.items()):
+                status = match.get("status", "open")
+                if status in {"completed", "cancelled"}:
+                    continue
+                challenger_id = match.get("challenger_id")
+                opponent_id = match.get("opponent_id")
+                participants = {pid for pid in (challenger_id, opponent_id) if pid}
+                if departed_user_id not in participants:
+                    continue
+
+                challenger_present = challenger_id is not None and guild.get_member(challenger_id) is not None
+                opponent_present = opponent_id is not None and guild.get_member(opponent_id) is not None
+
+                if opponent_id and (not challenger_present) and (not opponent_present):
+                    await self._cancel_match_with_embed_update(
+                        gid,
+                        category,
+                        match_id,
+                        reason=f"Cancelled automatically ({source}): both players left the server.",
+                    )
+                    continue
+
+                if status in {"open", "pending"}:
+                    await self._cancel_match_with_embed_update(
+                        gid,
+                        category,
+                        match_id,
+                        reason=f"Cancelled automatically ({source}): a participant left the server.",
+                    )
+                    continue
+
+                if status not in {"awaiting_result", "pending_cancel", "disputed", "active"}:
+                    continue
+                if challenger_id is None or opponent_id is None:
+                    await self._cancel_match_with_embed_update(
+                        gid,
+                        category,
+                        match_id,
+                        reason=f"Cancelled automatically ({source}): participant data missing.",
+                    )
+                    continue
+
+                winner_id = opponent_id if departed_user_id == challenger_id else challenger_id
+                loser_id = departed_user_id
+                if guild.get_member(winner_id) is None:
+                    await self._cancel_match_with_embed_update(
+                        gid,
+                        category,
+                        match_id,
+                        reason=f"Cancelled automatically ({source}): both players left the server.",
+                    )
+                    continue
+
+                board_cfg = self.get_leaderboard_config(gid, category)
+                mode_info = self.normalize_mode_value(
+                    match.get("mode") or board_cfg.get("mode") or self.get_category_mode(gid, category)
+                )
+                if mode_info["type"] == "time":
+                    winner_metric = 0.001
+                    loser_metric = 30.0
+                else:
+                    target = int(mode_info.get("target", 1))
+                    winner_metric = float(target)
+                    loser_metric = 0.0
+
+                outcome = await self.complete_match(
+                    guild,
+                    category,
+                    match_id,
+                    (winner_id, {"metric": winner_metric}),
+                    (loser_id, {"metric": loser_metric}),
+                    override_notes=f"Auto-forfeit ({source}): player left server.",
+                )
+                if outcome == "error":
+                    logger.warning(
+                        "Failed auto-forfeit for guild %s category %s match %s after member %s left",
+                        gid,
+                        category,
+                        match_id,
+                        departed_user_id,
+                    )
 
     async def cancel_active_match(self, guild_id: int, category: str, match_id: str) -> bool:
         match = self.get_match(guild_id, category, match_id)
@@ -1229,7 +1483,7 @@ class LeaderboardCog(commands.Cog):
         await self.save_players_for(guild.id, category)
         now = datetime.now(timezone.utc)
         challenger_id = match.get("challenger_id")
-        await self.save_match_for(
+        winner_match_row_id = await self.save_match_for(
             guild.id,
             category,
             winner_id,
@@ -1241,7 +1495,7 @@ class LeaderboardCog(commands.Cog):
             "Win",
             elo_delta,
         )
-        await self.save_match_for(
+        loser_match_row_id = await self.save_match_for(
             guild.id,
             category,
             loser_id,
@@ -1267,6 +1521,8 @@ class LeaderboardCog(commands.Cog):
             "loser_new_elo": loser_new_elo,
             "winner_old_elo": winner_old_elo,
             "loser_old_elo": loser_old_elo,
+            "winner_match_row_id": winner_match_row_id,
+            "loser_match_row_id": loser_match_row_id,
         }
         match["submissions"] = {}
         match["cancel_votes"] = []
@@ -1315,7 +1571,16 @@ class LeaderboardCog(commands.Cog):
                 if override_notes:
                     announce_embed.add_field(name="Notes", value=override_notes, inline=False)
                 try:
-                    await announce_channel.send(embed=announce_embed)
+                    message = await announce_channel.send(embed=announce_embed)
+                    if winner_match_row_id:
+                        await asyncio.to_thread(
+                            self.storage.save_match_announcement,
+                            guild.id,
+                            category,
+                            winner_match_row_id,
+                            announce_channel.id,
+                            message.id,
+                        )
                 except Exception:
                     logger.debug("Failed to post announcement for guild %s match %s", guild.id, match_id)
         thread_id = match.get("thread_id")
@@ -1327,12 +1592,198 @@ class LeaderboardCog(commands.Cog):
                 except Exception:
                     logger.debug("Failed to post result in thread %s for guild %s", thread_id, guild.id)
             await self.schedule_thread_deletion(guild.id, thread_id, category)
-        removed_match = bucket["matches"].pop(match_id, None)
-        if removed_match is not None:
-            await self.save_active_fights_for(guild.id)
         winner_label = winner_member.display_name if isinstance(winner_member, discord.Member) else self.user_snapshot_name_for(guild.id, winner_id)
         loser_label = loser_member.display_name if isinstance(loser_member, discord.Member) else self.user_snapshot_name_for(guild.id, loser_id)
         return f"Match recorded: {winner_label} defeated {loser_label} ({detail})."
+
+    async def replay_board_history(self, gid: int, category: str) -> Dict[str, Any]:
+        rows = await asyncio.to_thread(self.storage.load_raw_match_rows, gid, category)
+        if not rows:
+            return {"updated_rows": 0, "replayed_matches": 0, "users": 0}
+        mode_info = self.get_category_mode(gid, category)
+        safe_cat = normalize_category(category)
+        loss_index: Dict[Tuple[str, int, int], List[Dict[str, Any]]] = {}
+        for row in rows:
+            if row.get("result") != "Loss":
+                continue
+            key = (str(row.get("recorded_at")), int(row.get("user_id")), int(row.get("opponent_id")))
+            loss_index.setdefault(key, []).append(row)
+
+        stats_map: Dict[int, Dict[str, Any]] = {}
+
+        def ensure_stats(user_id: int) -> Dict[str, Any]:
+            if user_id not in stats_map:
+                stats_map[user_id] = {"elo": DEFAULT_START_ELO, "wins": 0, "losses": 0}
+            return stats_map[user_id]
+
+        updates: List[Dict[str, Any]] = []
+        replayed_matches = 0
+        for row in rows:
+            if row.get("result") != "Win":
+                continue
+            winner_id = int(row["user_id"])
+            loser_id = int(row["opponent_id"])
+            winner_stats = ensure_stats(winner_id)
+            loser_stats = ensure_stats(loser_id)
+
+            if mode_info["type"] == "time":
+                winner_metric = self.parse_time(str(row.get("user_value") or "").strip())
+                loser_metric = self.parse_time(str(row.get("opponent_value") or "").strip())
+                if winner_metric is None:
+                    winner_metric = 0.001
+                if loser_metric is None:
+                    loser_metric = 30.0
+            else:
+                target = int(mode_info.get("target", 1))
+                winner_score = self.parse_score(str(row.get("user_value") or "").strip())
+                loser_score = self.parse_score(str(row.get("opponent_value") or "").strip())
+                if winner_score is None:
+                    winner_score = target
+                if loser_score is None:
+                    loser_score = 0
+                winner_score = max(target, winner_score)
+                loser_score = max(0, loser_score)
+                winner_metric = float(winner_score)
+                loser_metric = float(loser_score)
+
+            elo_delta = self.compute_elo_change(
+                mode_info,
+                float(winner_stats["elo"]),
+                float(loser_stats["elo"]),
+                winner_metric,
+                loser_metric,
+            )
+            winner_stats["wins"] += 1
+            loser_stats["losses"] += 1
+            winner_stats["elo"] = max(0.0, float(winner_stats["elo"]) + elo_delta)
+            loser_stats["elo"] = max(0.0, float(loser_stats["elo"]) - elo_delta)
+
+            updates.append(
+                {
+                    "id": int(row["id"]),
+                    "user_id": winner_id,
+                    "opponent_id": loser_id,
+                    "challenger": bool(row.get("challenger")),
+                    "user_value": row.get("user_value"),
+                    "opponent_value": row.get("opponent_value"),
+                    "result": "Win",
+                    "elo_change": elo_delta,
+                }
+            )
+            loss_key = (str(row.get("recorded_at")), loser_id, winner_id)
+            loss_rows = loss_index.get(loss_key, [])
+            loss_row = loss_rows.pop(0) if loss_rows else None
+            if loss_row:
+                updates.append(
+                    {
+                        "id": int(loss_row["id"]),
+                        "user_id": loser_id,
+                        "opponent_id": winner_id,
+                        "challenger": bool(loss_row.get("challenger")),
+                        "user_value": loss_row.get("user_value"),
+                        "opponent_value": loss_row.get("opponent_value"),
+                        "result": "Loss",
+                        "elo_change": -elo_delta,
+                    }
+                )
+            replayed_matches += 1
+
+        await asyncio.to_thread(self.storage.update_match_rows, gid, category, updates)
+
+        gid_s = str(gid)
+        players = self.load_players_for(gid, category)
+        removed_map = self.removed.setdefault(gid_s, {}).setdefault(safe_cat, {})
+        for uid, payload in stats_map.items():
+            snapshot = {
+                "elo": float(payload["elo"]),
+                "wins": int(payload["wins"]),
+                "losses": int(payload["losses"]),
+            }
+            if uid in removed_map:
+                removed_map[uid] = snapshot
+            else:
+                players[uid] = snapshot
+        self.players_data.setdefault(gid_s, {})[safe_cat] = players
+        self.removed.setdefault(gid_s, {})[safe_cat] = removed_map
+        await self.save_players_for(gid, category)
+        await self.update_leaderboard_message_for(gid, category)
+        return {"updated_rows": len(updates), "replayed_matches": replayed_matches, "users": len(stats_map)}
+
+    async def announce_correction(
+        self,
+        guild: discord.Guild,
+        category: str,
+        winner_row_id: int,
+        winner_id: int,
+        loser_id: int,
+        original_detail: str,
+        corrected_detail: str,
+        moderator: discord.Member,
+        notes: Optional[str],
+    ) -> str:
+        board_cfg = self.get_leaderboard_config(guild.id, category)
+        board_name = board_cfg.get("name", category)
+        winner_member = guild.get_member(winner_id) or self.client.get_user(winner_id)
+        loser_member = guild.get_member(loser_id) or self.client.get_user(loser_id)
+        winner_label = winner_member.mention if winner_member else f"<@{winner_id}>"
+        loser_label = loser_member.mention if loser_member else f"<@{loser_id}>"
+        embed = discord.Embed(
+            title=f"{board_name} Result Corrected",
+            color=discord.Color.orange(),
+            description=f"{winner_label} defeated {loser_label} in {board_name}.",
+        )
+        embed.add_field(name="Original", value=original_detail, inline=False)
+        embed.add_field(name="Corrected", value=corrected_detail, inline=False)
+        embed.add_field(
+            name="Elo Recomputed",
+            value="Board Elo and history were recalculated from this match onward.",
+            inline=False,
+        )
+        embed.add_field(name="Moderator", value=moderator.mention, inline=True)
+        if notes:
+            embed.add_field(name="Notes", value=notes, inline=False)
+
+        tracked = await asyncio.to_thread(
+            self.storage.get_match_announcement,
+            guild.id,
+            category,
+            int(winner_row_id),
+        )
+        if tracked:
+            tracked_channel = self.client.get_channel(tracked["channel_id"])
+            if tracked_channel is not None:
+                try:
+                    tracked_msg = await tracked_channel.fetch_message(tracked["message_id"])
+                    await tracked_msg.edit(embed=embed)
+                    return "edited"
+                except Exception:
+                    logger.debug(
+                        "Failed editing historical announcement for guild %s category %s winner row %s",
+                        guild.id,
+                        category,
+                        winner_row_id,
+                    )
+
+        announce_channel_id = board_cfg.get("announce_channel_id")
+        announce_channel = self.client.get_channel(announce_channel_id) if announce_channel_id else None
+        if announce_channel is None and tracked:
+            announce_channel = self.client.get_channel(tracked["channel_id"])
+        if announce_channel is None:
+            return "unavailable"
+        try:
+            posted = await announce_channel.send(embed=embed)
+            await asyncio.to_thread(
+                self.storage.save_match_announcement,
+                guild.id,
+                category,
+                int(winner_row_id),
+                announce_channel.id,
+                posted.id,
+            )
+            return "posted"
+        except Exception:
+            logger.debug("Failed posting correction announcement for guild %s category %s", guild.id, category)
+            return "failed"
 
     async def count_member_matches(self, gid: int, category: str, member_id: int) -> int:
         return await asyncio.to_thread(self.storage.count_member_matches, gid, category, member_id)
@@ -1416,14 +1867,34 @@ class LeaderboardCog(commands.Cog):
     @leaderboard.command(name="override")
     @app_commands.describe(
         category="Leaderboard name",
-        winner="Winner",
-        loser="Loser",
+        mode="Override mode",
         winner_value="Winner result",
         loser_value="Loser result",
+        match_ref="Historical completed match (required in completed mode)",
+        active_ref="Ongoing match (required in ongoing mode)",
+        winner="Winner (required in ongoing mode; optional in completed mode)",
+        loser="Loser (required in ongoing mode; optional in completed mode)",
         notes="Optional notes for the log",
     )
-    @app_commands.autocomplete(category=category_autocomplete)
-    async def override(self, interaction: discord.Interaction, category: str, winner: discord.Member, loser: discord.Member, winner_value: str, loser_value: str, notes: Optional[str] = None):
+    @app_commands.choices(mode=OVERRIDE_MODE_CHOICES)
+    @app_commands.autocomplete(
+        category=category_autocomplete,
+        match_ref=override_match_autocomplete,
+        active_ref=override_active_match_autocomplete,
+    )
+    async def override(
+        self,
+        interaction: discord.Interaction,
+        category: str,
+        mode: app_commands.Choice[str],
+        winner_value: str,
+        loser_value: str,
+        match_ref: Optional[str] = None,
+        active_ref: Optional[str] = None,
+        winner: Optional[discord.Member] = None,
+        loser: Optional[discord.Member] = None,
+        notes: Optional[str] = None,
+    ):
         await interaction.response.defer(ephemeral=True)
         if not self.has_mod_permissions(interaction.user):
             await interaction.followup.send("You do not have permission to override results.", ephemeral=True)
@@ -1432,40 +1903,250 @@ class LeaderboardCog(commands.Cog):
             await interaction.followup.send("Server-only command.", ephemeral=True)
             return
         guild = interaction.guild
+        mode_key = self._coerce_override_mode(mode)
+        if mode_key not in {"completed", "ongoing"}:
+            await interaction.followup.send("Invalid override mode selected.", ephemeral=True)
+            return
+        board_cfg = self.get_leaderboard_config(guild.id, category)
+        if not board_cfg:
+            await interaction.followup.send("That leaderboard is not configured.", ephemeral=True)
+            return
+        mode_info = self.get_category_mode(guild.id, category)
+
+        def parse_override_values(mode: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+            if mode["type"] == "time":
+                winner_metric = self.parse_time(winner_value.strip())
+                loser_metric = self.parse_time(loser_value.strip())
+                if winner_metric is None or loser_metric is None:
+                    return None, "Invalid time format. Use MM:SS.sss or SS.sss"
+                return (
+                    {
+                        "winner_metric": winner_metric,
+                        "loser_metric": loser_metric,
+                        "winner_record_value": self.format_time_value(winner_metric),
+                        "loser_record_value": self.format_time_value(loser_metric),
+                    },
+                    None,
+                )
+            winner_score = self.parse_score(winner_value.strip())
+            loser_score = self.parse_score(loser_value.strip())
+            target = int(mode.get("target", 1))
+            if winner_score is None or loser_score is None:
+                return None, "Scores must be whole numbers."
+            if winner_score != target or loser_score >= target:
+                return None, f"Winning score must be {target}, and losing score must be less than {target}."
+            return (
+                {
+                    "winner_metric": float(winner_score),
+                    "loser_metric": float(loser_score),
+                    "winner_record_value": str(winner_score),
+                    "loser_record_value": str(loser_score),
+                    },
+                    None,
+                )
+
+        if mode_key == "completed":
+            if active_ref:
+                await interaction.followup.send(
+                    "active_ref can only be used with mode=ongoing.",
+                    ephemeral=True,
+                )
+                return
+            if not match_ref:
+                await interaction.followup.send(
+                    "match_ref is required when mode=completed.",
+                    ephemeral=True,
+                )
+                return
+            if (winner is None) != (loser is None):
+                await interaction.followup.send(
+                    "Provide both winner and loser, or leave both empty for completed corrections.",
+                    ephemeral=True,
+                )
+                return
+            parsed_values, parse_error = parse_override_values(mode_info)
+            if parsed_values is None:
+                await interaction.followup.send(parse_error or "Invalid result value.", ephemeral=True)
+                return
+            winner_record_value = str(parsed_values["winner_record_value"])
+            loser_record_value = str(parsed_values["loser_record_value"])
+            try:
+                winner_row_id = int(match_ref.strip())
+            except Exception:
+                await interaction.followup.send("Invalid historical match selection.", ephemeral=True)
+                return
+            pair_rows = await asyncio.to_thread(
+                self.storage.load_match_pair_by_winner_row_id,
+                guild.id,
+                category,
+                winner_row_id,
+            )
+            if not pair_rows:
+                await interaction.followup.send("That historical match could not be found.", ephemeral=True)
+                return
+            winner_row = pair_rows["winner"]
+            loser_row = pair_rows["loser"]
+            original_winner_id = int(winner_row["user_id"])
+            original_loser_id = int(loser_row["user_id"])
+            original_participants = {original_winner_id, original_loser_id}
+            if winner is not None and loser is not None:
+                if winner.id == loser.id:
+                    await interaction.followup.send("Winner and loser must be different players.", ephemeral=True)
+                    return
+                if {winner.id, loser.id} != original_participants:
+                    await interaction.followup.send(
+                        "The selected historical match is not between the chosen winner/loser pair.",
+                        ephemeral=True,
+                    )
+                    return
+                corrected_winner_id = winner.id
+                corrected_loser_id = loser.id
+            else:
+                corrected_winner_id = original_winner_id
+                corrected_loser_id = original_loser_id
+            challenger_map = {
+                int(winner_row["user_id"]): bool(winner_row.get("challenger")),
+                int(loser_row["user_id"]): bool(loser_row.get("challenger")),
+            }
+            updates = [
+                {
+                    "id": int(winner_row["id"]),
+                    "user_id": corrected_winner_id,
+                    "opponent_id": corrected_loser_id,
+                    "challenger": challenger_map.get(corrected_winner_id, False),
+                    "user_value": winner_record_value,
+                    "opponent_value": loser_record_value,
+                    "result": "Win",
+                    "elo_change": float(winner_row.get("elo_change", 0.0)),
+                },
+                {
+                    "id": int(loser_row["id"]),
+                    "user_id": corrected_loser_id,
+                    "opponent_id": corrected_winner_id,
+                    "challenger": challenger_map.get(corrected_loser_id, False),
+                    "user_value": loser_record_value,
+                    "opponent_value": winner_record_value,
+                    "result": "Loss",
+                    "elo_change": float(loser_row.get("elo_change", 0.0)),
+                },
+            ]
+            await asyncio.to_thread(self.storage.update_match_rows, guild.id, category, updates)
+            replay = await self.replay_board_history(guild.id, category)
+
+            original_winner_name = self.user_snapshot_name_for(guild.id, original_winner_id)
+            original_loser_name = self.user_snapshot_name_for(guild.id, original_loser_id)
+            corrected_winner_name = self.user_snapshot_name_for(guild.id, corrected_winner_id)
+            corrected_loser_name = self.user_snapshot_name_for(guild.id, corrected_loser_id)
+            if mode_info["type"] == "time":
+                original_score = f"{winner_row.get('user_value', '?')} vs {winner_row.get('opponent_value', '?')}"
+                corrected_score = f"{winner_record_value} vs {loser_record_value}"
+            else:
+                original_score = f"{winner_row.get('user_value', '?')}-{winner_row.get('opponent_value', '?')}"
+                corrected_score = f"{winner_record_value}-{loser_record_value}"
+            original_detail = f"{original_winner_name} defeated {original_loser_name} ({original_score})"
+            corrected_detail = f"{corrected_winner_name} defeated {corrected_loser_name} ({corrected_score})"
+            announce_state = await self.announce_correction(
+                guild,
+                category,
+                int(winner_row["id"]),
+                corrected_winner_id,
+                corrected_loser_id,
+                original_detail,
+                corrected_detail,
+                interaction.user,
+                notes,
+            )
+            try:
+                recorded_dt = datetime.fromisoformat(str(winner_row.get("recorded_at")))
+                if recorded_dt.tzinfo is None:
+                    recorded_dt = recorded_dt.replace(tzinfo=timezone.utc)
+                when_text = recorded_dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                when_text = str(winner_row.get("recorded_at") or "unknown time")
+            notes_text = notes if notes else "None"
+            await interaction.followup.send(
+                "Historical correction applied. "
+                f"Match: {when_text}. "
+                f"Original: {original_detail}. "
+                f"Corrected: {corrected_detail}. "
+                f"Elo replayed: {replay['replayed_matches']} match(es), {replay['updated_rows']} row updates. "
+                f"Announcement: {announce_state}. "
+                f"Notes: {notes_text}",
+                ephemeral=True,
+            )
+            return
+
+        if match_ref:
+            await interaction.followup.send(
+                "match_ref can only be used with mode=completed.",
+                ephemeral=True,
+            )
+            return
+        if not active_ref:
+            await interaction.followup.send(
+                "active_ref is required when mode=ongoing.",
+                ephemeral=True,
+            )
+            return
+        if winner is None or loser is None:
+            await interaction.followup.send(
+                "winner and loser are required when mode=ongoing.",
+                ephemeral=True,
+            )
+            return
         if winner.id == loser.id:
             await interaction.followup.send("Winner and loser must be different players.", ephemeral=True)
             return
-        pair = self.find_match_between(guild.id, category, winner.id, loser.id)
-        if not pair:
-            await interaction.followup.send("No active match found between those players.", ephemeral=True)
+        match_id = str(active_ref).strip()
+        match = self.get_match(guild.id, category, match_id)
+        if not match:
+            await interaction.followup.send("That active match could not be found.", ephemeral=True)
             return
-        match_id, match = pair
-        board_cfg = self.get_leaderboard_config(guild.id, category)
-        mode_info = self.normalize_mode_value(match.get("mode") or board_cfg.get("mode") or self.get_category_mode(guild.id, category))
-        if mode_info["type"] == "time":
-            winner_metric = self.parse_time(winner_value.strip())
-            loser_metric = self.parse_time(loser_value.strip())
-            if winner_metric is None or loser_metric is None:
-                await interaction.followup.send("Invalid time format. Use MM:SS.sss or SS.sss", ephemeral=True)
-                return
-            winner_record = {"kind": "win", "value": self.format_time_value(winner_metric), "metric": winner_metric}
-            loser_record = {"kind": "loss", "value": self.format_time_value(loser_metric), "metric": loser_metric}
-        else:
-            winner_score = self.parse_score(winner_value.strip())
-            loser_score = self.parse_score(loser_value.strip())
-            target = mode_info.get("target", 1)
-            if winner_score is None or loser_score is None:
-                await interaction.followup.send("Scores must be whole numbers.", ephemeral=True)
-                return
-            if winner_score != target:
-                await interaction.followup.send(f"Winning score must be {target}.", ephemeral=True)
-                return
-            if loser_score >= target:
-                await interaction.followup.send(f"Losing score must be less than {target}.", ephemeral=True)
-                return
-            winner_record = {"kind": "win", "value": str(winner_score), "metric": float(winner_score)}
-            loser_record = {"kind": "loss", "value": str(loser_score), "metric": float(loser_score)}
-        outcome = await self.complete_match(guild, category, match_id, (winner.id, winner_record), (loser.id, loser_record), override_notes=notes)
+        status = str(match.get("status") or "open")
+        allowed_statuses = {"awaiting_result", "pending_cancel", "disputed", "active"}
+        if status not in allowed_statuses:
+            await interaction.followup.send(
+                "That match is not eligible for ongoing override. Allowed statuses: awaiting_result, pending_cancel, disputed, active.",
+                ephemeral=True,
+            )
+            return
+        challenger_id = self._coerce_member_id(match.get("challenger_id"))
+        opponent_id = self._coerce_member_id(match.get("opponent_id"))
+        if challenger_id is None or opponent_id is None:
+            await interaction.followup.send(
+                "That active match is missing participant data and cannot be overridden.",
+                ephemeral=True,
+            )
+            return
+        if {winner.id, loser.id} != {challenger_id, opponent_id}:
+            await interaction.followup.send(
+                "Winner and loser must match the selected active match participants.",
+                ephemeral=True,
+            )
+            return
+        active_mode = self.normalize_mode_value(match.get("mode") or board_cfg.get("mode") or mode_info)
+        parsed_active_values, active_parse_error = parse_override_values(active_mode)
+        if parsed_active_values is None:
+            await interaction.followup.send(active_parse_error or "Invalid result value.", ephemeral=True)
+            return
+        winner_record = {
+            "kind": "win",
+            "value": str(parsed_active_values["winner_record_value"]),
+            "metric": float(parsed_active_values["winner_metric"]),
+        }
+        loser_record = {
+            "kind": "loss",
+            "value": str(parsed_active_values["loser_record_value"]),
+            "metric": float(parsed_active_values["loser_metric"]),
+        }
+        outcome = await self.complete_match(
+            guild,
+            category,
+            match_id,
+            (winner.id, winner_record),
+            (loser.id, loser_record),
+            override_notes=notes,
+        )
         if outcome == "error":
             await interaction.followup.send("Failed to override the match. Please try again.", ephemeral=True)
             return
@@ -1549,7 +2230,7 @@ class LeaderboardCog(commands.Cog):
         )
         embed.add_field(
             name="Logging Results",
-            value="- Use /leaderboard challenge opponent or /leaderboard challenge anyone to post a match\n- Players submit with /leaderboard iwon and /leaderboard ilost\n- Moderators can fix outcomes with /leaderboard override",
+            value="- Use /leaderboard challenge opponent or /leaderboard challenge anyone to post a match\n- Players submit with /leaderboard iwon and /leaderboard ilost\n- Use /leaderboard override mode:ongoing active_ref:<match> winner:<player> loser:<player>\n- Use /leaderboard override mode:completed match_ref:<historical> (winner/loser optional)",
             inline=False,
         )
         embed.add_field(
@@ -2389,20 +3070,17 @@ class LeaderboardCog(commands.Cog):
         bucket = self.get_active_bucket(gid, category)
         matches = bucket.get("matches", {})
         target_ids = {player1.id, player2.id}
-        removed_any = False
+        cancelled_any = False
         for match_id, data in list(matches.items()):
             participants = {data.get("challenger_id"), data.get("opponent_id")}
             if None in participants:
                 participants.discard(None)
             if participants == target_ids:
-                thread_id = data.get("thread_id")
-                matches.pop(match_id, None)
-                if thread_id:
-                    await self.schedule_thread_deletion(gid, thread_id, category)
-                removed_any = True
-        if not removed_any:
+                reason = f"Cancelled by moderator {interaction.user.display_name}."
+                cancelled = await self._cancel_match_with_embed_update(gid, category, match_id, reason=reason)
+                cancelled_any = cancelled_any or cancelled
+        if not cancelled_any:
             return await interaction.followup.send("No active run found.", ephemeral=True)
-        await self.save_active_fights_for(gid)
         await interaction.followup.send(f"Cancelled run between {player1.display_name} and {player2.display_name}.", ephemeral=True)
 
     async def removed_autocomplete(self, interaction: discord.Interaction, current: str):
@@ -2547,14 +3225,32 @@ class LeaderboardCog(commands.Cog):
                         if delete_at <= now:
                             tid = entry.get("thread_id")
                             if tid:
+                                active_thread = False
+                                for match_entry in cat_map.get("matches", {}).values():
+                                    if match_entry.get("thread_id") != tid:
+                                        continue
+                                    status = match_entry.get("status", "open")
+                                    if status not in {"completed", "cancelled"}:
+                                        active_thread = True
+                                        break
+                                if active_thread:
+                                    deletions.remove(entry)
+                                    category_changed = True
+                                    changed = True
+                                    continue
                                 thread = self.client.get_channel(tid)
                                 if thread:
                                     try:
                                         await thread.delete()
                                     except Exception:
                                         logger.exception("Failed deleting thread %s for guild %s", tid, gid_s)
-                                for match_entry in cat_map.get("matches", {}).values():
-                                    if match_entry.get("thread_id") == tid:
+                                for match_key, match_entry in list(cat_map.get("matches", {}).items()):
+                                    if match_entry.get("thread_id") != tid:
+                                        continue
+                                    status = match_entry.get("status", "open")
+                                    if status in {"completed", "cancelled"}:
+                                        cat_map["matches"].pop(match_key, None)
+                                    else:
                                         match_entry.pop("thread_id", None)
                                         match_entry.pop("thread_message_id", None)
                             deletions.remove(entry)
@@ -2616,6 +3312,33 @@ class LeaderboardCog(commands.Cog):
             await asyncio.sleep(0)
 
     @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.guild is None:
+            return
+        if not isinstance(message.channel, discord.Thread):
+            return
+        if message.author == self.client.user:
+            return
+        match_ctx = self.find_match_by_thread(message.guild.id, message.channel.id)
+        if not match_ctx:
+            return
+        _, _, match = match_ctx
+        bot_id = self.client.user.id if self.client.user else None
+        allowed_ids = {pid for pid in (bot_id, match.get("challenger_id"), match.get("opponent_id")) if pid}
+        if message.author.id in allowed_ids:
+            return
+        if isinstance(message.author, discord.Member) and self.has_mod_permissions(message.author):
+            return
+        try:
+            await message.delete()
+        except Exception:
+            logger.debug("Failed deleting unauthorized message %s in thread %s", message.id, message.channel.id)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        await self._resolve_departed_member_matches(member.guild, member.id, source="member_remove")
+
+    @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         if before.guild.id != after.guild.id:
             return
@@ -2670,7 +3393,7 @@ class LeaderboardCog(commands.Cog):
         if self._cleanup_task is None:
             self._cleanup_task = self.client.loop.create_task(self._deletion_loop())
         restored = 0
-        for gid_s, cat_map in self.active_fights.items():
+        for gid_s, cat_map in list(self.active_fights.items()):
             try:
                 gid = int(gid_s)
             except Exception:
@@ -2691,6 +3414,29 @@ class LeaderboardCog(commands.Cog):
                     match.pop("thread_message_id", None)
         if restored:
             logger.info("Restored %s challenge controls after reconnect.", restored)
+
+        for gid_s, cat_map in list(self.active_fights.items()):
+            try:
+                gid = int(gid_s)
+            except Exception:
+                continue
+            guild = self.client.get_guild(gid)
+            if guild is None:
+                continue
+            missing_members = set()
+            for payload in cat_map.values():
+                matches = payload.get("matches", {})
+                for match in matches.values():
+                    status = match.get("status", "open")
+                    if status in {"completed", "cancelled"}:
+                        continue
+                    challenger_id = match.get("challenger_id")
+                    opponent_id = match.get("opponent_id")
+                    for participant_id in (challenger_id, opponent_id):
+                        if participant_id and guild.get_member(participant_id) is None:
+                            missing_members.add(participant_id)
+            for missing_user_id in missing_members:
+                await self._resolve_departed_member_matches(guild, missing_user_id, source="startup_reconcile")
 
 async def setup(client: commands.Bot):
     await client.add_cog(LeaderboardCog(client))
