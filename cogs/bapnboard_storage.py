@@ -44,6 +44,8 @@ class BoardStorage:
                     announce_channel_id INTEGER,
                     leaderboard_channel_id INTEGER,
                     leaderboard_message_id INTEGER,
+                    pending_timeout_enabled INTEGER DEFAULT 1,
+                    anti_farm_enabled INTEGER DEFAULT 1,
                     thread_cleanup_seconds INTEGER DEFAULT 21600,
                     PRIMARY KEY (guild_id, category)
                 );
@@ -181,6 +183,14 @@ class BoardStorage:
                 conn.execute("ALTER TABLE active_matches ADD COLUMN thread_message_id INTEGER")
             except sqlite3.OperationalError:
                 pass
+            try:
+                conn.execute("ALTER TABLE leaderboards ADD COLUMN pending_timeout_enabled INTEGER DEFAULT 1")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE leaderboards ADD COLUMN anti_farm_enabled INTEGER DEFAULT 1")
+            except sqlite3.OperationalError:
+                pass
     def _ensure_guild_entry(self, target: Dict[str, Dict[str, Any]], gid_s: str) -> Dict[str, Any]:
         data = target.get(gid_s)
         if data is None:
@@ -225,6 +235,7 @@ class BoardStorage:
                     gid_s = str(row["guild_id"])
                     safe = row["category"]
                     data = self._ensure_guild_entry(guild_configs, gid_s)
+                    row_keys = row.keys()
                     entry = {
                         "name": row["display_name"],
                         "participant_role_id": row["participant_role_id"],
@@ -233,6 +244,8 @@ class BoardStorage:
                         "announce_channel_id": row["announce_channel_id"],
                         "leaderboard_channel_id": row["leaderboard_channel_id"],
                         "leaderboard_message_id": row["leaderboard_message_id"],
+                        "pending_timeout_enabled": bool(row["pending_timeout_enabled"]) if "pending_timeout_enabled" in row_keys else True,
+                        "anti_farm_enabled": bool(row["anti_farm_enabled"]) if "anti_farm_enabled" in row_keys else True,
                         "thread_cleanup_seconds": row["thread_cleanup_seconds"] or data.get("thread_cleanup_seconds", 21600),
                     }
                     data["leaderboards"][safe] = entry
@@ -415,9 +428,11 @@ class BoardStorage:
                                 announce_channel_id,
                                 leaderboard_channel_id,
                                 leaderboard_message_id,
+                                pending_timeout_enabled,
+                                anti_farm_enabled,
                                 thread_cleanup_seconds
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 gid,
@@ -429,6 +444,8 @@ class BoardStorage:
                                 board.get("announce_channel_id"),
                                 board.get("leaderboard_channel_id"),
                                 board.get("leaderboard_message_id"),
+                                1 if board.get("pending_timeout_enabled", True) else 0,
+                                1 if board.get("anti_farm_enabled", True) else 0,
                                 board.get("thread_cleanup_seconds", payload.get("thread_cleanup_seconds", 21600)),
                             ),
                         )
@@ -686,6 +703,35 @@ class BoardStorage:
                     )
                 return output
 
+    def load_recent_challenger_opponents(
+        self,
+        guild_id: int,
+        category: str,
+        challenger_id: int,
+        limit: int = 4,
+    ) -> List[int]:
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT opponent_id
+                    FROM matches
+                    WHERE guild_id=?
+                      AND category=?
+                      AND user_id=?
+                      AND challenger=1
+                      AND result IN ('Win', 'Loss')
+                    ORDER BY recorded_at DESC, id DESC
+                    LIMIT ?
+                    """,
+                    (guild_id, safe, int(challenger_id), max(1, int(limit))),
+                )
+                output: List[int] = []
+                for row in rows:
+                    output.append(int(row["opponent_id"]))
+                return output
+
     def load_recent_pair_matches(
         self,
         guild_id: int,
@@ -814,6 +860,79 @@ class BoardStorage:
                     },
                 }
 
+    def delete_match_pair_by_winner_row_id(
+        self,
+        guild_id: int,
+        category: str,
+        winner_row_id: int,
+    ) -> Optional[Dict[str, Dict[str, Any]]]:
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                winner_row = conn.execute(
+                    """
+                    SELECT id, user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
+                    FROM matches
+                    WHERE guild_id=? AND category=? AND id=? AND result='Win'
+                    """,
+                    (guild_id, safe, int(winner_row_id)),
+                ).fetchone()
+                if winner_row is None:
+                    return None
+                loser_row = conn.execute(
+                    """
+                    SELECT id, user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
+                    FROM matches
+                    WHERE guild_id=?
+                      AND category=?
+                      AND recorded_at=?
+                      AND user_id=?
+                      AND opponent_id=?
+                      AND result='Loss'
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """,
+                    (
+                        guild_id,
+                        safe,
+                        winner_row["recorded_at"],
+                        int(winner_row["opponent_id"]),
+                        int(winner_row["user_id"]),
+                    ),
+                ).fetchone()
+                if loser_row is None:
+                    return None
+
+                output = {
+                    "winner": {
+                        "id": int(winner_row["id"]),
+                        "user_id": int(winner_row["user_id"]),
+                        "recorded_at": winner_row["recorded_at"],
+                        "opponent_id": int(winner_row["opponent_id"]),
+                        "challenger": bool(winner_row["challenger"]),
+                        "user_value": winner_row["user_value"],
+                        "opponent_value": winner_row["opponent_value"],
+                        "result": winner_row["result"],
+                        "elo_change": float(winner_row["elo_change"]),
+                    },
+                    "loser": {
+                        "id": int(loser_row["id"]),
+                        "user_id": int(loser_row["user_id"]),
+                        "recorded_at": loser_row["recorded_at"],
+                        "opponent_id": int(loser_row["opponent_id"]),
+                        "challenger": bool(loser_row["challenger"]),
+                        "user_value": loser_row["user_value"],
+                        "opponent_value": loser_row["opponent_value"],
+                        "result": loser_row["result"],
+                        "elo_change": float(loser_row["elo_change"]),
+                    },
+                }
+                conn.execute(
+                    "DELETE FROM matches WHERE guild_id=? AND category=? AND id IN (?, ?)",
+                    (guild_id, safe, int(winner_row["id"]), int(loser_row["id"])),
+                )
+                return output
+
     def update_match_rows(self, guild_id: int, category: str, rows: List[Dict[str, Any]]) -> None:
         if not rows:
             return
@@ -885,6 +1004,15 @@ class BoardStorage:
                 if row is None:
                     return None
                 return {"channel_id": int(row["channel_id"]), "message_id": int(row["message_id"])}
+
+    def delete_match_announcement(self, guild_id: int, category: str, winner_match_id: int) -> None:
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM match_announcements WHERE guild_id=? AND category=? AND winner_match_id=?",
+                    (guild_id, safe, int(winner_match_id)),
+                )
 
     def load_match_history(self, guild_id: int, category: str) -> List[Dict[str, Any]]:
         safe = normalize_category(category)

@@ -30,6 +30,9 @@ OVERRIDE_MODE_CHOICES = [
     app_commands.Choice(name="Ongoing Match", value="ongoing"),
 ]
 
+ANTI_FARM_WINDOW = 4
+ANTI_FARM_MIN_UNIQUE = 3
+
 
 async def category_autocomplete(interaction: discord.Interaction, current: str):
     if interaction.guild is None:
@@ -95,6 +98,12 @@ async def override_match_autocomplete(interaction: discord.Interaction, current:
     if cog is None:
         return []
     return await cog.override_match_autocomplete(interaction, current)
+
+async def revoke_match_autocomplete(interaction: discord.Interaction, current: str):
+    cog = interaction.client.get_cog("LeaderboardCog")
+    if cog is None:
+        return []
+    return await cog.revoke_match_autocomplete(interaction, current)
 
 
 async def override_active_match_autocomplete(interaction: discord.Interaction, current: str):
@@ -177,6 +186,8 @@ class LeaderboardCog(commands.Cog):
                         "announce_channel_id": data.get("announce_channel_id"),
                         "leaderboard_channel_id": data.get("leaderboard_channel_id"),
                         "leaderboard_message_id": data.get("leaderboard_message_id"),
+                        "pending_timeout_enabled": True,
+                        "anti_farm_enabled": True,
                         "thread_cleanup_seconds": int(data.get("thread_cleanup_seconds", 21600)),
                         "mode": {"key": mode_info["key"], "target": mode_info["target"]},
                     }
@@ -196,6 +207,20 @@ class LeaderboardCog(commands.Cog):
                 entry["announce_channel_id"] = entry.get("announce_channel_id") or data.get("announce_channel_id")
                 entry["leaderboard_channel_id"] = entry.get("leaderboard_channel_id") or data.get("leaderboard_channel_id")
                 entry["leaderboard_message_id"] = entry.get("leaderboard_message_id") or data.get("leaderboard_message_id")
+                timeout_enabled = entry.get("pending_timeout_enabled")
+                if timeout_enabled is None:
+                    entry["pending_timeout_enabled"] = True
+                    changed_any = True
+                elif not isinstance(timeout_enabled, bool):
+                    entry["pending_timeout_enabled"] = bool(timeout_enabled)
+                    changed_any = True
+                anti_farm_enabled = entry.get("anti_farm_enabled")
+                if anti_farm_enabled is None:
+                    entry["anti_farm_enabled"] = True
+                    changed_any = True
+                elif not isinstance(anti_farm_enabled, bool):
+                    entry["anti_farm_enabled"] = bool(anti_farm_enabled)
+                    changed_any = True
                 entry["thread_cleanup_seconds"] = int(entry.get("thread_cleanup_seconds", data.get("thread_cleanup_seconds", 21600)))
                 mode_source = entry.get("mode") or converted_modes.get(safe_name) or {"key": "speedrun", "target": None}
                 normalized_mode = self.normalize_mode_value(mode_source)
@@ -373,14 +398,12 @@ class LeaderboardCog(commands.Cog):
             return value.strip().lower()
         return None
 
-    async def override_match_autocomplete(self, interaction: discord.Interaction, current: str):
-        if interaction.guild is None:
-            return []
-        category = getattr(interaction.namespace, "category", None)
-        mode_raw = getattr(interaction.namespace, "mode", None)
-        mode = self._coerce_override_mode(mode_raw)
-        if not category or mode != "completed":
-            return []
+    async def _completed_match_autocomplete_choices(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+        category: str,
+    ) -> List[app_commands.Choice[str]]:
         try:
             rows = await asyncio.to_thread(
                 self.storage.load_recent_completed_matches,
@@ -416,6 +439,24 @@ class LeaderboardCog(commands.Cog):
             if len(choices) >= 25:
                 break
         return choices
+
+    async def override_match_autocomplete(self, interaction: discord.Interaction, current: str):
+        if interaction.guild is None:
+            return []
+        category = getattr(interaction.namespace, "category", None)
+        mode_raw = getattr(interaction.namespace, "mode", None)
+        mode = self._coerce_override_mode(mode_raw)
+        if not category or mode != "completed":
+            return []
+        return await self._completed_match_autocomplete_choices(interaction, current, category)
+
+    async def revoke_match_autocomplete(self, interaction: discord.Interaction, current: str):
+        if interaction.guild is None:
+            return []
+        category = getattr(interaction.namespace, "category", None)
+        if not category:
+            return []
+        return await self._completed_match_autocomplete_choices(interaction, current, category)
 
     async def override_active_match_autocomplete(self, interaction: discord.Interaction, current: str):
         if interaction.guild is None:
@@ -533,6 +574,21 @@ class LeaderboardCog(commands.Cog):
         boards = data.get("leaderboards", {})
         board = boards.get(safe)
         if board:
+            changed = False
+            if board.get("pending_timeout_enabled") is None:
+                board["pending_timeout_enabled"] = True
+                changed = True
+            elif not isinstance(board.get("pending_timeout_enabled"), bool):
+                board["pending_timeout_enabled"] = bool(board.get("pending_timeout_enabled"))
+                changed = True
+            if board.get("anti_farm_enabled") is None:
+                board["anti_farm_enabled"] = True
+                changed = True
+            elif not isinstance(board.get("anti_farm_enabled"), bool):
+                board["anti_farm_enabled"] = bool(board.get("anti_farm_enabled"))
+                changed = True
+            if changed:
+                self._schedule_config_save()
             return board
         legacy_categories = data.get("categories", [])
         if any(entry.lower() == category.lower() for entry in legacy_categories):
@@ -544,6 +600,8 @@ class LeaderboardCog(commands.Cog):
                 "announce_channel_id": data.get("announce_channel_id"),
                 "leaderboard_channel_id": data.get("leaderboard_channel_id"),
                 "leaderboard_message_id": data.get("leaderboard_message_id"),
+                "pending_timeout_enabled": True,
+                "anti_farm_enabled": True,
                 "thread_cleanup_seconds": int(data.get("thread_cleanup_seconds", 21600)),
             }
             mode_map = data.get("category_modes", {})
@@ -564,6 +622,8 @@ class LeaderboardCog(commands.Cog):
         merged = dict(existing)
         merged.update(payload)
         merged["name"] = payload.get("name", existing.get("name", category))
+        merged["pending_timeout_enabled"] = bool(merged.get("pending_timeout_enabled", True))
+        merged["anti_farm_enabled"] = bool(merged.get("anti_farm_enabled", True))
         boards[safe] = merged
         self._schedule_config_save()
         return merged
@@ -636,6 +696,94 @@ class LeaderboardCog(commands.Cog):
                 if opponent is None and challenger == user_id:
                     return category, match_id, data
         return None
+
+    def list_pending_targeted_for_opponent(self, gid: int, category: str, opponent_id: int) -> List[Tuple[str, Dict[str, Any]]]:
+        bucket = self.get_active_bucket(gid, category)
+        rows: List[Tuple[datetime, str, Dict[str, Any]]] = []
+        for match_id, data in bucket.get("matches", {}).items():
+            if str(data.get("status") or "open") != "pending":
+                continue
+            if self._coerce_member_id(data.get("opponent_id")) != int(opponent_id):
+                continue
+            created_raw = str(data.get("created_at") or "")
+            try:
+                created_dt = datetime.fromisoformat(created_raw)
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=timezone.utc)
+            except Exception:
+                created_dt = datetime.now(timezone.utc)
+            rows.append((created_dt, str(match_id), data))
+        rows.sort(key=lambda item: (item[0], item[1]))
+        return [(match_id, data) for _, match_id, data in rows]
+
+    def build_discord_message_link(self, guild_id: int, channel_id: Any, message_id: Any) -> Optional[str]:
+        try:
+            gid = int(guild_id)
+            cid = int(channel_id)
+            mid = int(message_id)
+        except Exception:
+            return None
+        return f"https://discord.com/channels/{gid}/{cid}/{mid}"
+
+    def find_blocking_in_progress_match_for(
+        self,
+        gid: int,
+        user_id: int,
+        exclude: Optional[str] = None,
+    ) -> Optional[Tuple[str, str, Dict[str, Any]]]:
+        gid_s = str(gid)
+        cat_map = self.active_fights.get(gid_s, {})
+        for category, bucket in cat_map.items():
+            matches = bucket.get("matches", {})
+            for match_id, data in matches.items():
+                if exclude and str(match_id) == str(exclude):
+                    continue
+                status = str(data.get("status") or "open")
+                if status in {"completed", "cancelled"}:
+                    continue
+                challenger = self._coerce_member_id(data.get("challenger_id"))
+                opponent = self._coerce_member_id(data.get("opponent_id"))
+                if user_id not in {challenger, opponent}:
+                    continue
+                if status in {"awaiting_result", "pending_cancel", "disputed", "active"}:
+                    return category, str(match_id), data
+                # Incoming pending invites do not block. Outgoing queues/pending do.
+                if status == "open" and challenger == user_id:
+                    return category, str(match_id), data
+                if status == "pending" and challenger == user_id:
+                    return category, str(match_id), data
+        return None
+
+    async def is_anti_farm_blocked(self, gid: int, category: str, challenger_id: int, target_opponent_id: int) -> Tuple[bool, str]:
+        board_cfg = self.get_leaderboard_config(gid, category)
+        if not board_cfg:
+            return False, ""
+        if not bool(board_cfg.get("anti_farm_enabled", True)):
+            return False, ""
+        try:
+            recent_opponents = await asyncio.to_thread(
+                self.storage.load_recent_challenger_opponents,
+                gid,
+                category,
+                challenger_id,
+                ANTI_FARM_WINDOW,
+            )
+        except Exception:
+            return False, ""
+        if len(recent_opponents) < ANTI_FARM_WINDOW:
+            return False, ""
+        unique_recent = {int(uid) for uid in recent_opponents}
+        if len(unique_recent) >= ANTI_FARM_MIN_UNIQUE:
+            return False, ""
+        if int(target_opponent_id) not in unique_recent:
+            return False, ""
+        names = ", ".join(self.user_snapshot_name_for(gid, uid) for uid in sorted(unique_recent))
+        reason = (
+            "Anti-farm is enabled for this leaderboard. "
+            f"Your last {ANTI_FARM_WINDOW} completed challenges only involved {names}. "
+            "Challenge someone else before challenging this player again."
+        )
+        return True, reason
 
     def has_mod_permissions(self, member: discord.Member) -> bool:
         perms = member.guild_permissions
@@ -1185,7 +1333,29 @@ class LeaderboardCog(commands.Cog):
         if opponent_id and opponent_id != interaction.user.id:
             await interaction.response.send_message("This challenge is reserved for another player.", ephemeral=True)
             return
-        existing_match = self.find_active_match_for(guild_id, interaction.user.id, exclude=match_id)
+        if status == "pending" and opponent_id == interaction.user.id:
+            pending_targeted = self.list_pending_targeted_for_opponent(guild_id, category, interaction.user.id)
+            if pending_targeted:
+                oldest_match_id, oldest_match = pending_targeted[0]
+                if str(oldest_match_id) != str(match_id):
+                    older_link = self.build_discord_message_link(
+                        guild_id,
+                        oldest_match.get("channel_id"),
+                        oldest_match.get("message_id"),
+                    )
+                    if older_link:
+                        await interaction.response.send_message(
+                            f"This person challenged you previously: {older_link}. Please respond to that challenge first.",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.response.send_message(
+                            "This person challenged you previously. Please respond to the oldest pending challenge first.",
+                            ephemeral=True,
+                        )
+                    return
+
+        existing_match = self.find_blocking_in_progress_match_for(guild_id, interaction.user.id, exclude=match_id)
         if existing_match:
             existing_category, existing_match_id, existing_data = existing_match
             existing_status = existing_data.get("status", "open")
@@ -1214,6 +1384,14 @@ class LeaderboardCog(commands.Cog):
                     if diff > int(rank_range):
                         await interaction.response.send_message(f"You must be within {rank_range} ranks of the challenger to accept.", ephemeral=True)
                         return
+            challenger_match_id = self._coerce_member_id(challenger_id)
+            if challenger_match_id is None:
+                await interaction.response.send_message("This challenge is missing challenger data.", ephemeral=True)
+                return
+            blocked, reason = await self.is_anti_farm_blocked(guild_id, category, challenger_match_id, interaction.user.id)
+            if blocked:
+                await interaction.response.send_message(reason, ephemeral=True)
+                return
             match["opponent_id"] = interaction.user.id
         match["status"] = "awaiting_result"
         match["accepted_at"] = datetime.now(timezone.utc).isoformat()
@@ -1599,6 +1777,19 @@ class LeaderboardCog(commands.Cog):
     async def replay_board_history(self, gid: int, category: str) -> Dict[str, Any]:
         rows = await asyncio.to_thread(self.storage.load_raw_match_rows, gid, category)
         if not rows:
+            gid_s = str(gid)
+            safe_cat = normalize_category(category)
+            players = self.load_players_for(gid, category)
+            removed_map = self.removed.setdefault(gid_s, {}).setdefault(safe_cat, {})
+            baseline = {"elo": DEFAULT_START_ELO, "wins": 0, "losses": 0}
+            for uid in list(players.keys()):
+                players[uid] = dict(baseline)
+            for uid in list(removed_map.keys()):
+                removed_map[uid] = dict(baseline)
+            self.players_data.setdefault(gid_s, {})[safe_cat] = players
+            self.removed.setdefault(gid_s, {})[safe_cat] = removed_map
+            await self.save_players_for(gid, category)
+            await self.update_leaderboard_message_for(gid, category)
             return {"updated_rows": 0, "replayed_matches": 0, "users": 0}
         mode_info = self.get_category_mode(gid, category)
         safe_cat = normalize_category(category)
@@ -1703,6 +1894,17 @@ class LeaderboardCog(commands.Cog):
                 removed_map[uid] = snapshot
             else:
                 players[uid] = snapshot
+
+        baseline = {"elo": DEFAULT_START_ELO, "wins": 0, "losses": 0}
+        known_ids = set(players.keys()) | set(removed_map.keys())
+        for uid in known_ids:
+            if uid in stats_map:
+                continue
+            if uid in removed_map:
+                removed_map[uid] = dict(baseline)
+            else:
+                players[uid] = dict(baseline)
+
         self.players_data.setdefault(gid_s, {})[safe_cat] = players
         self.removed.setdefault(gid_s, {})[safe_cat] = removed_map
         await self.save_players_for(gid, category)
@@ -2152,6 +2354,168 @@ class LeaderboardCog(commands.Cog):
             return
         await interaction.followup.send(f"Override applied. {outcome}", ephemeral=True)
 
+    @leaderboard.command(name="revoke")
+    @app_commands.describe(
+        category="Leaderboard name",
+        match_ref="Historical completed match to revoke",
+        notes="Optional notes for the log",
+    )
+    @app_commands.autocomplete(category=category_autocomplete, match_ref=revoke_match_autocomplete)
+    async def revoke(self, interaction: discord.Interaction, category: str, match_ref: str, notes: Optional[str] = None):
+        await interaction.response.defer(ephemeral=True)
+        if not self.has_mod_permissions(interaction.user):
+            await interaction.followup.send("You do not have permission to revoke results.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.followup.send("Server-only command.", ephemeral=True)
+            return
+        guild = interaction.guild
+        board_cfg = self.get_leaderboard_config(guild.id, category)
+        if not board_cfg:
+            await interaction.followup.send("That leaderboard is not configured.", ephemeral=True)
+            return
+        try:
+            winner_row_id = int(str(match_ref).strip())
+        except Exception:
+            await interaction.followup.send("Invalid historical match selection.", ephemeral=True)
+            return
+
+        pair_rows = await asyncio.to_thread(
+            self.storage.load_match_pair_by_winner_row_id,
+            guild.id,
+            category,
+            winner_row_id,
+        )
+        if not pair_rows:
+            await interaction.followup.send("That historical match could not be found.", ephemeral=True)
+            return
+
+        winner_row = pair_rows["winner"]
+        loser_row = pair_rows["loser"]
+        winner_id = int(winner_row["user_id"])
+        loser_id = int(loser_row["user_id"])
+        winner_name = self.user_snapshot_name_for(guild.id, winner_id)
+        loser_name = self.user_snapshot_name_for(guild.id, loser_id)
+        mode_info = self.get_category_mode(guild.id, category)
+        if mode_info["type"] == "time":
+            score_text = f"{winner_row.get('user_value', '?')} vs {winner_row.get('opponent_value', '?')}"
+        else:
+            score_text = f"{winner_row.get('user_value', '?')}-{winner_row.get('opponent_value', '?')}"
+        try:
+            recorded_dt = datetime.fromisoformat(str(winner_row.get("recorded_at")))
+            if recorded_dt.tzinfo is None:
+                recorded_dt = recorded_dt.replace(tzinfo=timezone.utc)
+            when_text = recorded_dt.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            when_text = str(winner_row.get("recorded_at") or "unknown time")
+
+        announce_state = "unavailable"
+        board_name = board_cfg.get("name", category)
+        revoke_embed = discord.Embed(
+            title=f"{board_name} Result Revoked",
+            color=discord.Color.red(),
+            description=(
+                f"{winner_name} vs {loser_name} from {when_text} was revoked.\n"
+                f"Original Result: {score_text}"
+            ),
+        )
+        revoke_embed.add_field(name="Moderator", value=interaction.user.mention, inline=True)
+        if notes:
+            revoke_embed.add_field(name="Notes", value=notes, inline=False)
+        tracked = await asyncio.to_thread(
+            self.storage.get_match_announcement,
+            guild.id,
+            category,
+            winner_row_id,
+        )
+        if tracked:
+            tracked_channel = self.client.get_channel(tracked["channel_id"])
+            if tracked_channel is not None:
+                try:
+                    tracked_msg = await tracked_channel.fetch_message(tracked["message_id"])
+                    await tracked_msg.edit(embed=revoke_embed)
+                    announce_state = "edited"
+                except Exception:
+                    announce_state = "failed"
+        if announce_state != "edited":
+            announce_channel_id = board_cfg.get("announce_channel_id")
+            announce_channel = self.client.get_channel(announce_channel_id) if announce_channel_id else None
+            if announce_channel is not None:
+                try:
+                    await announce_channel.send(embed=revoke_embed)
+                    announce_state = "posted"
+                except Exception:
+                    if announce_state == "unavailable":
+                        announce_state = "failed"
+
+        deleted_pair = await asyncio.to_thread(
+            self.storage.delete_match_pair_by_winner_row_id,
+            guild.id,
+            category,
+            winner_row_id,
+        )
+        if not deleted_pair:
+            await interaction.followup.send("Unable to revoke that match. It may have been changed already.", ephemeral=True)
+            return
+        await asyncio.to_thread(
+            self.storage.delete_match_announcement,
+            guild.id,
+            category,
+            winner_row_id,
+        )
+
+        revoked_row_ids = {int(winner_row["id"]), int(loser_row["id"])}
+        bucket = self.get_active_bucket(guild.id, category)
+        cancelled_active: List[str] = []
+        for active_match_id, active_match in list(bucket.get("matches", {}).items()):
+            result = active_match.get("result")
+            if not isinstance(result, dict):
+                continue
+            winner_ref = result.get("winner_match_row_id")
+            loser_ref = result.get("loser_match_row_id")
+            refs = set()
+            try:
+                if winner_ref is not None:
+                    refs.add(int(winner_ref))
+            except Exception:
+                pass
+            try:
+                if loser_ref is not None:
+                    refs.add(int(loser_ref))
+            except Exception:
+                pass
+            if refs.isdisjoint(revoked_row_ids):
+                continue
+            active_match["status"] = "cancelled"
+            active_match.pop("result", None)
+            active_match["submissions"] = {}
+            active_match["cancel_votes"] = []
+            active_match.pop("response_deadline", None)
+            active_match["cancel_reason"] = (
+                f"Result revoked by moderator {interaction.user.display_name}."
+            )
+            bucket["matches"][active_match_id] = active_match
+            cancelled_active.append(active_match_id)
+        if cancelled_active:
+            await self.save_active_fights_for(guild.id)
+            for active_match_id in cancelled_active:
+                await self.refresh_match_message(guild.id, category, active_match_id)
+                active_match = bucket["matches"].get(active_match_id) or {}
+                thread_id = active_match.get("thread_id")
+                if thread_id:
+                    await self.schedule_thread_deletion(guild.id, int(thread_id), category)
+
+        replay = await self.replay_board_history(guild.id, category)
+        notes_text = notes if notes else "None"
+        await interaction.followup.send(
+            "Historical match revoked. "
+            f"Removed: {winner_name} vs {loser_name} ({score_text}) at {when_text}. "
+            f"Elo replayed: {replay['replayed_matches']} match(es), {replay['updated_rows']} row updates. "
+            f"Announcement: {announce_state}. "
+            f"Cancelled active records: {len(cancelled_active)}. "
+            f"Notes: {notes_text}",
+            ephemeral=True,
+        )
 
     @leaderboard.command(name="categories")
     async def categories(self, interaction: discord.Interaction):
@@ -2188,6 +2552,8 @@ class LeaderboardCog(commands.Cog):
             announce_target = announce_channel.mention if announce_channel else "Not set"
             cleanup_seconds = int(data.get("thread_cleanup_seconds", 21600))
             cleanup_hours = cleanup_seconds / 3600
+            timeout_state = "On" if bool(data.get("pending_timeout_enabled", True)) else "Off"
+            anti_farm_state = "On" if bool(data.get("anti_farm_enabled", True)) else "Off"
             summary_lines = [
                 f"Players: {player_line}",
                 f"Mode: {mode_label}",
@@ -2196,6 +2562,8 @@ class LeaderboardCog(commands.Cog):
                 f"Challenge Channel: {challenge_target}",
                 f"Outgoing Channel: {outgoing_target}",
                 f"Announcements: {announce_target}",
+                f"Challenge Timeout: {timeout_state}",
+                f"Anti-Farm: {anti_farm_state}",
                 f"Thread Cleanup: {cleanup_hours:.1f}h",
             ]
             if active_players:
@@ -2225,12 +2593,12 @@ class LeaderboardCog(commands.Cog):
         embed.add_field(name="Modes", value="\n".join(mode_lines), inline=False)
         embed.add_field(
             name="Editing & Maintenance",
-            value="- /leaderboard editboard player:<member> to tweak stats\n- /leaderboard editboard leaderboard_channel:<channel> to move the board message\n- /leaderboard editboard mode:<mode> mode_target:<score> for rule updates\n- /leaderboard removeplayer or /leaderboard readd to manage roster",
+            value="- /leaderboard editboard player:<member> to tweak stats\n- /leaderboard editboard leaderboard_channel:<channel> to move the board message\n- /leaderboard editboard mode:<mode> mode_target:<score> for rule updates\n- /leaderboard challenge-timeout category:<board> enabled:<true/false>\n- /leaderboard anti-farm category:<board> enabled:<true/false>\n- /leaderboard removeplayer or /leaderboard readd to manage roster",
             inline=False,
         )
         embed.add_field(
             name="Logging Results",
-            value="- Use /leaderboard challenge opponent or /leaderboard challenge anyone to post a match\n- Players submit with /leaderboard iwon and /leaderboard ilost\n- Use /leaderboard override mode:ongoing active_ref:<match> winner:<player> loser:<player>\n- Use /leaderboard override mode:completed match_ref:<historical> (winner/loser optional)",
+            value="- Use /leaderboard challenge opponent or /leaderboard challenge anyone to post a match\n- Players submit with /leaderboard iwon and /leaderboard ilost\n- Use /leaderboard override mode:ongoing active_ref:<match> winner:<player> loser:<player>\n- Use /leaderboard override mode:completed match_ref:<historical> (winner/loser optional)\n- Use /leaderboard revoke match_ref:<historical> to remove a completed match and replay Elo",
             inline=False,
         )
         embed.add_field(
@@ -2321,6 +2689,8 @@ class LeaderboardCog(commands.Cog):
             "challenge_channel_id": challenge_channel.id,
             "outgoing_channel_id": outgoing_channel.id if outgoing_channel else (previous.get("outgoing_channel_id") if previous else None),
             "announce_channel_id": announcement_channel.id if announcement_channel else (previous.get("announce_channel_id") if previous else None),
+            "pending_timeout_enabled": previous.get("pending_timeout_enabled", True) if previous else True,
+            "anti_farm_enabled": previous.get("anti_farm_enabled", True) if previous else True,
             "thread_cleanup_seconds": cleanup_seconds,
             "mode": {"key": mode_info["key"], "target": mode_info["target"]} if mode_info else (previous.get("mode") if previous else None),
         }
@@ -2587,6 +2957,49 @@ class LeaderboardCog(commands.Cog):
         if not leaderboard_moved:
             await self.update_leaderboard_message_for(gid, current_name)
         await interaction.followup.send("Changes applied: " + "; ".join(updates), ephemeral=True)
+
+    @leaderboard.command(name="challenge-timeout")
+    @app_commands.describe(category="Leaderboard name", enabled="Whether pending direct challenges expire automatically")
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def challenge_timeout(self, interaction: discord.Interaction, category: str, enabled: bool):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.guild is None:
+            return await interaction.followup.send("Server-only command.", ephemeral=True)
+        if not self.has_mod_permissions(interaction.user):
+            return await interaction.followup.send("You do not have permission.", ephemeral=True)
+        gid = interaction.guild.id
+        board_cfg = self.get_leaderboard_config(gid, category)
+        if not board_cfg:
+            return await interaction.followup.send("That leaderboard is not configured.", ephemeral=True)
+        board_cfg["pending_timeout_enabled"] = bool(enabled)
+        self.upsert_leaderboard_config(gid, category, board_cfg)
+        state = "ON" if enabled else "OFF"
+        await interaction.followup.send(
+            f"Pending direct challenge timeout is now {state} for {board_cfg.get('name', category)}.",
+            ephemeral=True,
+        )
+
+    @leaderboard.command(name="anti-farm")
+    @app_commands.describe(category="Leaderboard name", enabled="Whether anti-farm challenge rotation rules are enforced")
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def anti_farm(self, interaction: discord.Interaction, category: str, enabled: bool):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.guild is None:
+            return await interaction.followup.send("Server-only command.", ephemeral=True)
+        if not self.has_mod_permissions(interaction.user):
+            return await interaction.followup.send("You do not have permission.", ephemeral=True)
+        gid = interaction.guild.id
+        board_cfg = self.get_leaderboard_config(gid, category)
+        if not board_cfg:
+            return await interaction.followup.send("That leaderboard is not configured.", ephemeral=True)
+        board_cfg["anti_farm_enabled"] = bool(enabled)
+        self.upsert_leaderboard_config(gid, category, board_cfg)
+        state = "ON" if enabled else "OFF"
+        await interaction.followup.send(
+            f"Anti-farm is now {state} for {board_cfg.get('name', category)}.",
+            ephemeral=True,
+        )
+
     @challenge_group.command(name="anyone")
     @app_commands.describe(category="Leaderboard name", rank_range="Rank window", automatch="Try to auto-match with an existing open challenge")
     @app_commands.autocomplete(category=category_autocomplete)
@@ -2602,7 +3015,7 @@ class LeaderboardCog(commands.Cog):
         role_id = board_cfg.get("participant_role_id")
         if role_id and role_id not in [role.id for role in interaction.user.roles]:
             return await interaction.followup.send("You need the participant role to issue challenges.", ephemeral=True)
-        if self.find_active_match_for(gid, interaction.user.id):
+        if self.find_blocking_in_progress_match_for(gid, interaction.user.id):
             return await interaction.followup.send("You already have an active challenge.", ephemeral=True)
         if automatch:
             bucket = self.get_active_bucket(gid, category)
@@ -2624,6 +3037,12 @@ class LeaderboardCog(commands.Cog):
                         window_ok = window_ok and diff <= int(rank_range)
                     if not window_ok:
                         continue
+                challenger_id = self._coerce_member_id(m.get("challenger_id"))
+                if challenger_id is None:
+                    continue
+                blocked, _ = await self.is_anti_farm_blocked(gid, category, challenger_id, interaction.user.id)
+                if blocked:
+                    continue
                 m["opponent_id"] = interaction.user.id
                 m["status"] = "awaiting_result"
                 m.pop("response_deadline", None)
@@ -2731,14 +3150,21 @@ class LeaderboardCog(commands.Cog):
         role_id = board_cfg.get("participant_role_id")
         if role_id and role_id not in [role.id for role in interaction.user.roles]:
             return await interaction.followup.send("You need the participant role to issue challenges.", ephemeral=True)
-        if self.find_active_match_for(gid, interaction.user.id):
+        if self.find_blocking_in_progress_match_for(gid, interaction.user.id):
             return await interaction.followup.send("You already have an active challenge.", ephemeral=True)
         if opponent.id == interaction.user.id:
             return await interaction.followup.send("You cannot challenge yourself.", ephemeral=True)
         if role_id and role_id not in [role.id for role in opponent.roles]:
             return await interaction.followup.send(f"{opponent.display_name} is not registered for this leaderboard.", ephemeral=True)
-        if self.find_active_match_for(gid, opponent.id):
-            return await interaction.followup.send(f"{opponent.display_name} already has an active challenge.", ephemeral=True)
+        opponent_blocking = self.find_blocking_in_progress_match_for(gid, opponent.id)
+        if opponent_blocking:
+            return await interaction.followup.send(
+                f"{opponent.display_name} already has an in-progress challenge.",
+                ephemeral=True,
+            )
+        blocked, reason = await self.is_anti_farm_blocked(gid, category, interaction.user.id, opponent.id)
+        if blocked:
+            return await interaction.followup.send(reason, ephemeral=True)
         outgoing_channel_id = board_cfg.get("outgoing_channel_id") or board_cfg.get("challenge_channel_id")
         if not outgoing_channel_id:
             return await interaction.followup.send("No outgoing or challenge channel configured for this leaderboard.", ephemeral=True)
@@ -2761,8 +3187,9 @@ class LeaderboardCog(commands.Cog):
             "mode": {"key": mode_info["key"], "target": mode_info["target"]},
             "submissions": {},
             "cancel_votes": [],
-            "response_deadline": (datetime.now(timezone.utc) + PENDING_CHALLENGE_TIMEOUT).isoformat(),
         }
+        if bool(board_cfg.get("pending_timeout_enabled", True)):
+            match_data["response_deadline"] = (datetime.now(timezone.utc) + PENDING_CHALLENGE_TIMEOUT).isoformat()
         embed = self.build_match_embed(guild, category, match_data)
         allowed_mentions = discord.AllowedMentions(users=True)
         message = await channel.send(content=opponent.mention, embed=embed, allowed_mentions=allowed_mentions)
@@ -3262,7 +3689,9 @@ class LeaderboardCog(commands.Cog):
                     for match_id, match_data in list(matches.items()):
                         status = match_data.get("status")
                         opponent_id = match_data.get("opponent_id")
-                        if status == "pending" and opponent_id:
+                        board_cfg = self.get_leaderboard_config(gid, category)
+                        timeout_enabled = bool(board_cfg.get("pending_timeout_enabled", True)) if board_cfg else True
+                        if status == "pending" and opponent_id and timeout_enabled:
                             deadline_raw = match_data.get("response_deadline")
                             deadline_dt = None
                             if deadline_raw:
