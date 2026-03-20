@@ -1,6 +1,7 @@
 ﻿import asyncio
 import copy
 import functools
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -12,6 +13,7 @@ from discord.ext import commands
 from .bapnboard_shared import (
     DB_FILE,
     DEFAULT_START_ELO,
+    GLOBAL_BAN_SCOPE,
     GLOBAL_BIO_KEY,
     MODE_TYPE_CHOICES,
     MODES,
@@ -30,8 +32,24 @@ OVERRIDE_MODE_CHOICES = [
     app_commands.Choice(name="Ongoing Match", value="ongoing"),
 ]
 
+PLAYER_BAN_ACTION_CHOICES = [
+    app_commands.Choice(name="Ban", value="ban"),
+    app_commands.Choice(name="Unban", value="unban"),
+    app_commands.Choice(name="List", value="list"),
+]
+
+PLAYER_BAN_SCOPE_CHOICES = [
+    app_commands.Choice(name="All Leaderboards", value="all"),
+    app_commands.Choice(name="Specific Leaderboard", value="leaderboard"),
+]
+
 ANTI_FARM_WINDOW = 4
 ANTI_FARM_MIN_UNIQUE = 3
+INACTIVITY_DECAY_DEFAULT_ENABLED = True
+INACTIVITY_DECAY_DEFAULT_DAYS = 7
+INACTIVITY_DECAY_DEFAULT_AMOUNT = 10.0
+INACTIVITY_DECAY_DEFAULT_FLOOR = DEFAULT_START_ELO
+INACTIVITY_DECAY_SWEEP_SECONDS = 600
 
 
 async def category_autocomplete(interaction: discord.Interaction, current: str):
@@ -116,6 +134,7 @@ class LeaderboardCog(commands.Cog):
     leaderboard = app_commands.Group(name="leaderboard", description="Leaderboard commands", guild_only=True)
 
     challenge_group = app_commands.Group(name="challenge", description="Challenge commands", parent=leaderboard)
+    stats_group = app_commands.Group(name="stats", description="Analytics commands", parent=leaderboard)
 
     def __init__(self, client: commands.Bot):
         self.client = client
@@ -131,6 +150,9 @@ class LeaderboardCog(commands.Cog):
         self.active_fights = {}
         self.bios = {}
         self.removed = {}
+        self.bans = {}
+        self.decay_state = {}
+        self._last_decay_sweep = None
         self.load_all()
 
     def cog_unload(self):
@@ -156,6 +178,8 @@ class LeaderboardCog(commands.Cog):
         self.players_data = snapshot["players"]
         self.players_meta = snapshot["players_meta"]
         self.removed = snapshot["removed"]
+        self.bans = snapshot.get("bans", {})
+        self.decay_state = snapshot.get("decay_state", {})
         self.bios = snapshot["bios"]
         self.active_fights = snapshot["active_fights"]
         changed_any = False
@@ -188,6 +212,10 @@ class LeaderboardCog(commands.Cog):
                         "leaderboard_message_id": data.get("leaderboard_message_id"),
                         "pending_timeout_enabled": True,
                         "anti_farm_enabled": True,
+                        "inactivity_decay_enabled": INACTIVITY_DECAY_DEFAULT_ENABLED,
+                        "inactivity_decay_days": INACTIVITY_DECAY_DEFAULT_DAYS,
+                        "inactivity_decay_amount": INACTIVITY_DECAY_DEFAULT_AMOUNT,
+                        "inactivity_decay_floor": INACTIVITY_DECAY_DEFAULT_FLOOR,
                         "thread_cleanup_seconds": int(data.get("thread_cleanup_seconds", 21600)),
                         "mode": {"key": mode_info["key"], "target": mode_info["target"]},
                     }
@@ -221,6 +249,37 @@ class LeaderboardCog(commands.Cog):
                 elif not isinstance(anti_farm_enabled, bool):
                     entry["anti_farm_enabled"] = bool(anti_farm_enabled)
                     changed_any = True
+                decay_enabled = entry.get("inactivity_decay_enabled")
+                if decay_enabled is None:
+                    entry["inactivity_decay_enabled"] = INACTIVITY_DECAY_DEFAULT_ENABLED
+                    changed_any = True
+                elif not isinstance(decay_enabled, bool):
+                    entry["inactivity_decay_enabled"] = bool(decay_enabled)
+                    changed_any = True
+                try:
+                    decay_days = int(entry.get("inactivity_decay_days", INACTIVITY_DECAY_DEFAULT_DAYS))
+                except Exception:
+                    decay_days = INACTIVITY_DECAY_DEFAULT_DAYS
+                decay_days = max(1, decay_days)
+                if entry.get("inactivity_decay_days") != decay_days:
+                    entry["inactivity_decay_days"] = decay_days
+                    changed_any = True
+                try:
+                    decay_amount = float(entry.get("inactivity_decay_amount", INACTIVITY_DECAY_DEFAULT_AMOUNT))
+                except Exception:
+                    decay_amount = INACTIVITY_DECAY_DEFAULT_AMOUNT
+                decay_amount = max(0.0, decay_amount)
+                if entry.get("inactivity_decay_amount") != decay_amount:
+                    entry["inactivity_decay_amount"] = decay_amount
+                    changed_any = True
+                try:
+                    decay_floor = float(entry.get("inactivity_decay_floor", INACTIVITY_DECAY_DEFAULT_FLOOR))
+                except Exception:
+                    decay_floor = INACTIVITY_DECAY_DEFAULT_FLOOR
+                decay_floor = max(0.0, decay_floor)
+                if entry.get("inactivity_decay_floor") != decay_floor:
+                    entry["inactivity_decay_floor"] = decay_floor
+                    changed_any = True
                 entry["thread_cleanup_seconds"] = int(entry.get("thread_cleanup_seconds", data.get("thread_cleanup_seconds", 21600)))
                 mode_source = entry.get("mode") or converted_modes.get(safe_name) or {"key": "speedrun", "target": None}
                 normalized_mode = self.normalize_mode_value(mode_source)
@@ -232,8 +291,73 @@ class LeaderboardCog(commands.Cog):
             self.players_data.setdefault(gid_s, {})
             self.players_meta.setdefault(gid_s, {})
             self.removed.setdefault(gid_s, {})
+            self.bans.setdefault(gid_s, {})
+            self.decay_state.setdefault(gid_s, {})
             self.bios.setdefault(gid_s, {})
             self.active_fights.setdefault(gid_s, {})
+        for gid_s, scoped in list(self.bans.items()):
+            if not isinstance(scoped, dict):
+                self.bans[gid_s] = {}
+                continue
+            normalized_scopes: Dict[str, Dict[int, Dict[str, Any]]] = {}
+            for scope_raw, entries in scoped.items():
+                scope_key = str(scope_raw)
+                if scope_key != GLOBAL_BAN_SCOPE:
+                    scope_key = normalize_category(scope_key)
+                if not isinstance(entries, dict):
+                    continue
+                bucket: Dict[int, Dict[str, Any]] = {}
+                for uid_raw, payload in entries.items():
+                    try:
+                        uid = int(uid_raw)
+                    except Exception:
+                        continue
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    banned_at = payload.get("banned_at")
+                    if not banned_at:
+                        continue
+                    banned_by = payload.get("banned_by")
+                    try:
+                        banned_by_val = int(banned_by) if banned_by is not None else None
+                    except Exception:
+                        banned_by_val = None
+                    bucket[uid] = {
+                        "reason": payload.get("reason"),
+                        "banned_by": banned_by_val,
+                        "banned_at": str(banned_at),
+                    }
+                if bucket:
+                    normalized_scopes[scope_key] = bucket
+            self.bans[gid_s] = normalized_scopes
+        for gid_s, per_board in list(self.decay_state.items()):
+            if not isinstance(per_board, dict):
+                self.decay_state[gid_s] = {}
+                continue
+            normalized_board_state: Dict[str, Dict[int, str]] = {}
+            for board_raw, entries in per_board.items():
+                safe_board = normalize_category(str(board_raw))
+                if not isinstance(entries, dict):
+                    continue
+                bucket: Dict[int, str] = {}
+                for uid_raw, marker_raw in entries.items():
+                    try:
+                        uid = int(uid_raw)
+                    except Exception:
+                        continue
+                    marker = str(marker_raw or "").strip()
+                    if not marker:
+                        continue
+                    try:
+                        marker_dt = datetime.fromisoformat(marker)
+                        if marker_dt.tzinfo is None:
+                            marker_dt = marker_dt.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        continue
+                    bucket[uid] = marker_dt.isoformat()
+                if bucket:
+                    normalized_board_state[safe_board] = bucket
+            self.decay_state[gid_s] = normalized_board_state
         for gid_s, active_map in list(self.active_fights.items()):
             if not isinstance(active_map, dict):
                 self.active_fights[gid_s] = {}
@@ -304,6 +428,43 @@ class LeaderboardCog(commands.Cog):
         except Exception:
             return None
 
+    def parse_result_values(
+        self,
+        mode: Dict[str, Any],
+        winner_value: str,
+        loser_value: str,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        if mode["type"] == "time":
+            winner_metric = self.parse_time(winner_value.strip())
+            loser_metric = self.parse_time(loser_value.strip())
+            if winner_metric is None or loser_metric is None:
+                return None, "Invalid time format. Use MM:SS.sss or SS.sss"
+            return (
+                {
+                    "winner_metric": winner_metric,
+                    "loser_metric": loser_metric,
+                    "winner_record_value": self.format_time_value(winner_metric),
+                    "loser_record_value": self.format_time_value(loser_metric),
+                },
+                None,
+            )
+        winner_score = self.parse_score(winner_value.strip())
+        loser_score = self.parse_score(loser_value.strip())
+        target = int(mode.get("target", 1))
+        if winner_score is None or loser_score is None:
+            return None, "Scores must be whole numbers."
+        if winner_score != target or loser_score >= target:
+            return None, f"Winning score must be {target}, and losing score must be less than {target}."
+        return (
+            {
+                "winner_metric": float(winner_score),
+                "loser_metric": float(loser_score),
+                "winner_record_value": str(winner_score),
+                "loser_record_value": str(loser_score),
+            },
+            None,
+        )
+
     def load_players_for(self, gid: int, category: str):
         gid_s = str(gid)
         safe_cat = normalize_category(category)
@@ -315,14 +476,84 @@ class LeaderboardCog(commands.Cog):
 
     def get_player_rank(self, gid: int, category: str, user_id: int) -> Optional[Tuple[int, Dict[str, Any]]]:
         players = self.load_players_for(gid, category)
-        safe = normalize_category(category)
-        removed_map = self.removed.get(str(gid), {}).get(safe, {})
-        eligible = [(uid, data) for uid, data in players.items() if uid not in removed_map]
+        eligible = [(uid, data) for uid, data in players.items() if not self.is_hidden_from_leaderboard(gid, category, uid)]
         ranked = sorted(eligible, key=lambda item: item[1]["elo"], reverse=True)
         for index, (uid, data) in enumerate(ranked, start=1):
             if uid == user_id:
                 return index, data
         return None
+
+    def _effective_scope_key_for(self, scope: str, category: Optional[str] = None) -> Optional[str]:
+        normalized_scope = str(scope or "").strip().lower()
+        if normalized_scope == "all":
+            return GLOBAL_BAN_SCOPE
+        if normalized_scope == "leaderboard" and category:
+            return normalize_category(category)
+        return None
+
+    def _ban_bucket_for_scope(self, gid: int, scope_key: str) -> Dict[int, Dict[str, Any]]:
+        gid_s = str(gid)
+        scopes = self.bans.setdefault(gid_s, {})
+        bucket = scopes.get(scope_key)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            scopes[scope_key] = bucket
+        return bucket
+
+    async def save_bans_for(self, gid: int) -> None:
+        gid_s = str(gid)
+        bans_snapshot = copy.deepcopy(self.bans.get(gid_s, {}))
+        await asyncio.to_thread(self.storage.save_bans, gid, bans_snapshot)
+
+    def get_effective_ban_record(self, gid: int, category: str, user_id: int) -> Optional[Dict[str, Any]]:
+        scopes = self.bans.get(str(gid), {})
+        if not isinstance(scopes, dict):
+            return None
+        global_bucket = scopes.get(GLOBAL_BAN_SCOPE, {})
+        if isinstance(global_bucket, dict) and user_id in global_bucket:
+            payload = dict(global_bucket[user_id] or {})
+            payload["scope"] = GLOBAL_BAN_SCOPE
+            return payload
+        safe = normalize_category(category)
+        specific_bucket = scopes.get(safe, {})
+        if isinstance(specific_bucket, dict) and user_id in specific_bucket:
+            payload = dict(specific_bucket[user_id] or {})
+            payload["scope"] = safe
+            return payload
+        return None
+
+    def is_player_banned_for_category(self, gid: int, category: str, user_id: int) -> bool:
+        return self.get_effective_ban_record(gid, category, user_id) is not None
+
+    def is_hidden_from_leaderboard(self, gid: int, category: str, user_id: int) -> bool:
+        safe = normalize_category(category)
+        removed_map = self.removed.get(str(gid), {}).get(safe, {})
+        if user_id in removed_map:
+            return True
+        return self.is_player_banned_for_category(gid, category, user_id)
+
+    def iter_scoped_categories_for_ban(self, gid: int, scope: str, category: Optional[str] = None) -> List[str]:
+        normalized_scope = str(scope or "").strip().lower()
+        collected: List[str] = []
+        if normalized_scope == "leaderboard":
+            if category:
+                board_cfg = self.get_leaderboard_config(gid, category)
+                collected.append(board_cfg.get("name", category) if board_cfg else category)
+        else:
+            collected.extend(self.list_leaderboards(gid))
+            try:
+                collected.extend(self.storage.list_categories(gid))
+            except Exception:
+                pass
+            collected.extend(self.active_fights.get(str(gid), {}).keys())
+        mapping: Dict[str, str] = {}
+        for entry in collected:
+            if not entry:
+                continue
+            lowered = entry.lower()
+            if lowered not in mapping:
+                mapping[lowered] = entry
+        return [mapping[key] for key in sorted(mapping)]
 
     def is_participant(self, member: discord.Member, board_cfg: Dict[str, Any]) -> bool:
         role_id = board_cfg.get("participant_role_id")
@@ -336,14 +567,22 @@ class LeaderboardCog(commands.Cog):
         players_snapshot = copy.deepcopy(self.players_data.get(gid_s, {}).get(safe_cat, {}))
         meta_snapshot = copy.deepcopy(self.players_meta.get(gid_s, {}))
         removed_snapshot = copy.deepcopy(self.removed.get(gid_s, {}).get(safe_cat, {}))
+        decay_snapshot = copy.deepcopy(self.decay_state.get(gid_s, {}).get(safe_cat, {}))
         bios_snapshot = copy.deepcopy(self.bios.get(gid_s, {}).get(safe_cat, {}))
         await asyncio.gather(
             asyncio.to_thread(self.storage.save_players, gid, category, players_snapshot),
             asyncio.to_thread(self.storage.save_player_meta, gid, meta_snapshot),
             asyncio.to_thread(self.storage.save_removed, gid, category, removed_snapshot),
+            asyncio.to_thread(self.storage.save_decay_state, gid, category, decay_snapshot),
             asyncio.to_thread(self.storage.save_bios, gid, category, bios_snapshot),
         )
         await self.save_active_fights_for(gid)
+
+    async def save_decay_state_for(self, gid: int, category: str):
+        gid_s = str(gid)
+        safe_cat = normalize_category(category)
+        decay_snapshot = copy.deepcopy(self.decay_state.get(gid_s, {}).get(safe_cat, {}))
+        await asyncio.to_thread(self.storage.save_decay_state, gid, category, decay_snapshot)
 
     async def persist_player_meta(self, guild_id: int):
         gid_s = str(guild_id)
@@ -555,6 +794,260 @@ class LeaderboardCog(commands.Cog):
         line = f"{stamp} - {prefix}{winner_name} {verb} {loser_name} ({detail}){change_text}"
         return recorded_at, line
 
+    def _parse_recorded_datetime(self, raw_value: Any) -> Optional[datetime]:
+        if raw_value is None:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(raw_value))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _outcome_token(result: str) -> Optional[str]:
+        token = str(result or "")
+        if token in {"Win", "DeclineWin"}:
+            return "W"
+        if token == "Loss":
+            return "L"
+        return None
+
+    @staticmethod
+    def _is_database_corruption_error(exc: Exception) -> bool:
+        if isinstance(exc, sqlite3.DatabaseError):
+            return True
+        text = str(exc).lower()
+        return (
+            "database disk image is malformed" in text
+            or "malformed database schema" in text
+            or "database corruption" in text
+        )
+
+    def _format_integrity_sample(self, gid: int, category: str, row: Dict[str, Any]) -> str:
+        mode_info = self.get_category_mode(gid, category)
+        user_name = self.user_snapshot_name_for(gid, int(row.get("user_id", 0)))
+        opponent_name = self.user_snapshot_name_for(gid, int(row.get("opponent_id", 0)))
+        if mode_info["type"] == "time":
+            detail = f"{row.get('user_value', '?')} vs {row.get('opponent_value', '?')}"
+        else:
+            detail = f"{row.get('user_value', '?')}-{row.get('opponent_value', '?')}"
+        when_text = str(row.get("recorded_at") or "unknown time")
+        try:
+            parsed = datetime.fromisoformat(when_text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            when_text = parsed.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        return f"row {row.get('id')}: {user_name} vs {opponent_name} ({detail}, {when_text})"
+
+    async def ensure_history_integrity_for_replay(self, gid: int, category: str) -> Optional[str]:
+        report = await asyncio.to_thread(self.storage.audit_completed_history_integrity, gid, category, 2)
+        if not report.get("has_issues"):
+            return None
+
+        issues: List[str] = []
+        missing_loss_count = int(report.get("missing_loss_count", 0))
+        missing_win_count = int(report.get("missing_win_count", 0))
+        orphan_announcement_count = int(report.get("orphan_announcement_count", 0))
+        if missing_loss_count > 0:
+            issues.append(f"{missing_loss_count} winner row(s) without a matching loss row")
+        if missing_win_count > 0:
+            issues.append(f"{missing_win_count} loss row(s) without a matching winner row")
+        if orphan_announcement_count > 0:
+            issues.append(f"{orphan_announcement_count} announcement reference(s) to missing winner rows")
+
+        samples: List[str] = []
+        missing_loss_samples = report.get("missing_loss_samples") or []
+        if missing_loss_samples:
+            samples.append(self._format_integrity_sample(gid, category, missing_loss_samples[0]))
+        missing_win_samples = report.get("missing_win_samples") or []
+        if missing_win_samples:
+            samples.append(self._format_integrity_sample(gid, category, missing_win_samples[0]))
+        orphan_samples = report.get("orphan_announcement_samples") or []
+        if orphan_samples:
+            samples.append(f"orphan announcement winner row id {orphan_samples[0]}")
+
+        issue_text = "; ".join(issues) if issues else "history integrity errors"
+        sample_text = f" Example: {' | '.join(samples)}." if samples else ""
+        return (
+            "Safety check blocked this command: historical match integrity issues were detected "
+            f"({issue_text}). Completed-history replay was not run to avoid leaderboard rollback."
+            f"{sample_text} Repair history, then retry."
+        )
+
+    def compute_member_streaks(self, rows: List[Dict[str, Any]], member_id: int) -> Dict[str, Any]:
+        outcomes: List[str] = []
+        last_match_at: Optional[datetime] = None
+        for row in rows:
+            try:
+                uid = int(row.get("user_id"))
+            except Exception:
+                continue
+            if uid != int(member_id):
+                continue
+            token = self._outcome_token(str(row.get("result") or ""))
+            if token is None:
+                continue
+            outcomes.append(token)
+            row_dt = self._parse_recorded_datetime(row.get("date"))
+            if row_dt and (last_match_at is None or row_dt > last_match_at):
+                last_match_at = row_dt
+        if not outcomes:
+            return {
+                "matches": 0,
+                "current_type": None,
+                "current_count": 0,
+                "best_win": 0,
+                "best_loss": 0,
+                "last_match_at": last_match_at,
+            }
+        best_win = 0
+        best_loss = 0
+        run_token = outcomes[0]
+        run_len = 1
+        for token in outcomes[1:]:
+            if token == run_token:
+                run_len += 1
+            else:
+                if run_token == "W":
+                    best_win = max(best_win, run_len)
+                else:
+                    best_loss = max(best_loss, run_len)
+                run_token = token
+                run_len = 1
+        if run_token == "W":
+            best_win = max(best_win, run_len)
+        else:
+            best_loss = max(best_loss, run_len)
+
+        current_type = outcomes[-1]
+        current_count = 1
+        for idx in range(len(outcomes) - 2, -1, -1):
+            if outcomes[idx] != current_type:
+                break
+            current_count += 1
+        return {
+            "matches": len(outcomes),
+            "current_type": current_type,
+            "current_count": current_count,
+            "best_win": best_win,
+            "best_loss": best_loss,
+            "last_match_at": last_match_at,
+        }
+
+    async def apply_inactivity_decay_for_board(self, gid: int, category: str, now: Optional[datetime] = None) -> Dict[str, Any]:
+        board_cfg = self.get_leaderboard_config(gid, category)
+        if not board_cfg:
+            return {"changed_players": 0, "total_decay": 0.0, "eligible_players": 0}
+        enabled = bool(board_cfg.get("inactivity_decay_enabled", INACTIVITY_DECAY_DEFAULT_ENABLED))
+        if not enabled:
+            return {"changed_players": 0, "total_decay": 0.0, "eligible_players": 0}
+        try:
+            window_days = max(1, int(board_cfg.get("inactivity_decay_days", INACTIVITY_DECAY_DEFAULT_DAYS)))
+        except Exception:
+            window_days = INACTIVITY_DECAY_DEFAULT_DAYS
+        try:
+            decay_amount = max(0.0, float(board_cfg.get("inactivity_decay_amount", INACTIVITY_DECAY_DEFAULT_AMOUNT)))
+        except Exception:
+            decay_amount = INACTIVITY_DECAY_DEFAULT_AMOUNT
+        try:
+            floor_elo = max(0.0, float(board_cfg.get("inactivity_decay_floor", INACTIVITY_DECAY_DEFAULT_FLOOR)))
+        except Exception:
+            floor_elo = INACTIVITY_DECAY_DEFAULT_FLOOR
+        if decay_amount <= 0:
+            return {"changed_players": 0, "total_decay": 0.0, "eligible_players": 0}
+
+        current_dt = now or datetime.now(timezone.utc)
+        if current_dt.tzinfo is None:
+            current_dt = current_dt.replace(tzinfo=timezone.utc)
+        else:
+            current_dt = current_dt.astimezone(timezone.utc)
+
+        try:
+            rows = await asyncio.to_thread(self.storage.load_match_history, gid, category)
+        except Exception as exc:
+            if self._is_database_corruption_error(exc):
+                logger.error(
+                    "Skipping inactivity decay for guild %s board %s due to database corruption: %s",
+                    gid,
+                    category,
+                    exc,
+                )
+                return {"changed_players": 0, "total_decay": 0.0, "eligible_players": 0}
+            raise
+        last_activity: Dict[int, datetime] = {}
+        for row in rows:
+            token = self._outcome_token(str(row.get("result") or ""))
+            if token is None:
+                continue
+            try:
+                uid = int(row.get("user_id"))
+            except Exception:
+                continue
+            row_dt = self._parse_recorded_datetime(row.get("date"))
+            if row_dt is None:
+                continue
+            previous = last_activity.get(uid)
+            if previous is None or row_dt > previous:
+                last_activity[uid] = row_dt
+
+        gid_s = str(gid)
+        safe_cat = normalize_category(category)
+        players = self.load_players_for(gid, category)
+        state_bucket = self.decay_state.setdefault(gid_s, {}).setdefault(safe_cat, {})
+        player_ids = set(players.keys())
+        markers_changed = False
+        for stale_uid in list(state_bucket.keys()):
+            if stale_uid in player_ids:
+                continue
+            state_bucket.pop(stale_uid, None)
+            markers_changed = True
+
+        window_seconds = float(window_days * 86400)
+        changed_players = 0
+        total_decay = 0.0
+        eligible_players = 0
+        for uid, payload in players.items():
+            if self.is_hidden_from_leaderboard(gid, category, uid):
+                continue
+            last_active_at = last_activity.get(uid)
+            if last_active_at is None:
+                continue
+            eligible_players += 1
+            marker_dt = self._parse_recorded_datetime(state_bucket.get(uid))
+            reference = marker_dt if marker_dt and marker_dt >= last_active_at else last_active_at
+            elapsed_seconds = (current_dt - reference).total_seconds()
+            if elapsed_seconds < window_seconds:
+                continue
+            decay_windows = int(elapsed_seconds // window_seconds)
+            if decay_windows <= 0:
+                continue
+            old_elo = float(payload.get("elo", DEFAULT_START_ELO))
+            target_decay = float(decay_windows) * decay_amount
+            new_elo = max(floor_elo, old_elo - target_decay)
+            if abs(new_elo - old_elo) > 0.0001:
+                payload["elo"] = new_elo
+                changed_players += 1
+                total_decay += (old_elo - new_elo)
+            applied_marker = reference + timedelta(seconds=decay_windows * window_seconds)
+            state_bucket[uid] = applied_marker.isoformat()
+            markers_changed = True
+
+        if changed_players:
+            self.players_data.setdefault(gid_s, {})[safe_cat] = players
+            await self.save_players_for(gid, category)
+            await self.update_leaderboard_message_for(gid, category)
+        elif markers_changed:
+            await self.save_decay_state_for(gid, category)
+        return {
+            "changed_players": changed_players,
+            "total_decay": total_decay,
+            "eligible_players": eligible_players,
+        }
+
     def get_gconfig(self, gid: int):
         return self.guild_configs.get(str(gid), {})
 
@@ -587,6 +1080,36 @@ class LeaderboardCog(commands.Cog):
             elif not isinstance(board.get("anti_farm_enabled"), bool):
                 board["anti_farm_enabled"] = bool(board.get("anti_farm_enabled"))
                 changed = True
+            if board.get("inactivity_decay_enabled") is None:
+                board["inactivity_decay_enabled"] = INACTIVITY_DECAY_DEFAULT_ENABLED
+                changed = True
+            elif not isinstance(board.get("inactivity_decay_enabled"), bool):
+                board["inactivity_decay_enabled"] = bool(board.get("inactivity_decay_enabled"))
+                changed = True
+            try:
+                decay_days = int(board.get("inactivity_decay_days", INACTIVITY_DECAY_DEFAULT_DAYS))
+            except Exception:
+                decay_days = INACTIVITY_DECAY_DEFAULT_DAYS
+            decay_days = max(1, decay_days)
+            if board.get("inactivity_decay_days") != decay_days:
+                board["inactivity_decay_days"] = decay_days
+                changed = True
+            try:
+                decay_amount = float(board.get("inactivity_decay_amount", INACTIVITY_DECAY_DEFAULT_AMOUNT))
+            except Exception:
+                decay_amount = INACTIVITY_DECAY_DEFAULT_AMOUNT
+            decay_amount = max(0.0, decay_amount)
+            if board.get("inactivity_decay_amount") != decay_amount:
+                board["inactivity_decay_amount"] = decay_amount
+                changed = True
+            try:
+                decay_floor = float(board.get("inactivity_decay_floor", INACTIVITY_DECAY_DEFAULT_FLOOR))
+            except Exception:
+                decay_floor = INACTIVITY_DECAY_DEFAULT_FLOOR
+            decay_floor = max(0.0, decay_floor)
+            if board.get("inactivity_decay_floor") != decay_floor:
+                board["inactivity_decay_floor"] = decay_floor
+                changed = True
             if changed:
                 self._schedule_config_save()
             return board
@@ -602,6 +1125,10 @@ class LeaderboardCog(commands.Cog):
                 "leaderboard_message_id": data.get("leaderboard_message_id"),
                 "pending_timeout_enabled": True,
                 "anti_farm_enabled": True,
+                "inactivity_decay_enabled": INACTIVITY_DECAY_DEFAULT_ENABLED,
+                "inactivity_decay_days": INACTIVITY_DECAY_DEFAULT_DAYS,
+                "inactivity_decay_amount": INACTIVITY_DECAY_DEFAULT_AMOUNT,
+                "inactivity_decay_floor": INACTIVITY_DECAY_DEFAULT_FLOOR,
                 "thread_cleanup_seconds": int(data.get("thread_cleanup_seconds", 21600)),
             }
             mode_map = data.get("category_modes", {})
@@ -624,6 +1151,19 @@ class LeaderboardCog(commands.Cog):
         merged["name"] = payload.get("name", existing.get("name", category))
         merged["pending_timeout_enabled"] = bool(merged.get("pending_timeout_enabled", True))
         merged["anti_farm_enabled"] = bool(merged.get("anti_farm_enabled", True))
+        merged["inactivity_decay_enabled"] = bool(merged.get("inactivity_decay_enabled", INACTIVITY_DECAY_DEFAULT_ENABLED))
+        try:
+            merged["inactivity_decay_days"] = max(1, int(merged.get("inactivity_decay_days", INACTIVITY_DECAY_DEFAULT_DAYS)))
+        except Exception:
+            merged["inactivity_decay_days"] = INACTIVITY_DECAY_DEFAULT_DAYS
+        try:
+            merged["inactivity_decay_amount"] = max(0.0, float(merged.get("inactivity_decay_amount", INACTIVITY_DECAY_DEFAULT_AMOUNT)))
+        except Exception:
+            merged["inactivity_decay_amount"] = INACTIVITY_DECAY_DEFAULT_AMOUNT
+        try:
+            merged["inactivity_decay_floor"] = max(0.0, float(merged.get("inactivity_decay_floor", INACTIVITY_DECAY_DEFAULT_FLOOR)))
+        except Exception:
+            merged["inactivity_decay_floor"] = INACTIVITY_DECAY_DEFAULT_FLOOR
         boards[safe] = merged
         self._schedule_config_save()
         return merged
@@ -962,9 +1502,11 @@ class LeaderboardCog(commands.Cog):
 
     def build_leaderboard_view(self, gid: int, category: str) -> PagedListView:
         players = self.load_players_for(gid, category)
-        removed_map = self.removed.get(str(gid), {}).get(normalize_category(category), {})
-        removed_ids = set(removed_map.keys())
-        sorted_players = sorted(((uid, data) for uid, data in players.items() if uid not in removed_ids), key=lambda x: x[1]["elo"], reverse=True)
+        sorted_players = sorted(
+            ((uid, data) for uid, data in players.items() if not self.is_hidden_from_leaderboard(gid, category, uid)),
+            key=lambda x: x[1]["elo"],
+            reverse=True,
+        )
         lines = []
         medal_map = {1: "🥇", 2: "🥈", 3: "🥉"}
         for i, (uid, data) in enumerate(sorted_players, start=1):
@@ -1326,6 +1868,24 @@ class LeaderboardCog(commands.Cog):
             await interaction.response.send_message("You cannot accept your own challenge.", ephemeral=True)
             return
         board_cfg = self.get_leaderboard_config(guild_id, category)
+        if self.is_player_banned_for_category(guild_id, category, interaction.user.id):
+            await interaction.response.send_message("You are banned from this leaderboard.", ephemeral=True)
+            return
+        participants = {pid for pid in (challenger_id, opponent_id) if pid is not None}
+        for participant_id in participants:
+            if not self.is_player_banned_for_category(guild_id, category, int(participant_id)):
+                continue
+            await self._cancel_match_with_embed_update(
+                guild_id,
+                category,
+                match_id,
+                reason="Cancelled automatically: a participant is banned from this leaderboard.",
+            )
+            await interaction.response.send_message(
+                "This match was cancelled because a participant is banned from this leaderboard.",
+                ephemeral=True,
+            )
+            return
         member = interaction.guild.get_member(interaction.user.id)
         if not self.is_participant(member, board_cfg):
             await interaction.response.send_message("You are not registered for this leaderboard.", ephemeral=True)
@@ -1524,6 +2084,24 @@ class LeaderboardCog(commands.Cog):
             await interaction.followup.send("You do not have an active challenge.", ephemeral=True)
             return
         category, match_id, match = active
+        if self.is_player_banned_for_category(guild.id, category, interaction.user.id):
+            await interaction.followup.send("You are banned from this leaderboard.", ephemeral=True)
+            return
+        participants = {pid for pid in (match.get("challenger_id"), match.get("opponent_id")) if pid}
+        for participant_id in participants:
+            if not self.is_player_banned_for_category(guild.id, category, int(participant_id)):
+                continue
+            await self._cancel_match_with_embed_update(
+                guild.id,
+                category,
+                match_id,
+                reason="Cancelled automatically: a participant is banned from this leaderboard.",
+            )
+            await interaction.followup.send(
+                "This match was cancelled because a participant is banned from this leaderboard.",
+                ephemeral=True,
+            )
+            return
         status = match.get("status", "open")
         if status not in {"awaiting_result", "pending"}:
             if status == "pending_cancel":
@@ -1719,8 +2297,11 @@ class LeaderboardCog(commands.Cog):
         self.players_data[str(guild.id)][safe_cat] = players
         await self.update_leaderboard_message_for(guild.id, category)
         await self.refresh_match_message(guild.id, category, match_id)
-        remove_map = self.removed.get(str(guild.id), {}).get(safe_cat, {})
-        ranked = sorted(((uid, data) for uid, data in players.items() if uid not in remove_map), key=lambda item: item[1]["elo"], reverse=True)
+        ranked = sorted(
+            ((uid, data) for uid, data in players.items() if not self.is_hidden_from_leaderboard(guild.id, category, uid)),
+            key=lambda item: item[1]["elo"],
+            reverse=True,
+        )
         def rank_of(uid: int) -> Optional[int]:
             for idx, (entry_id, _) in enumerate(ranked, start=1):
                 if entry_id == uid:
@@ -2115,38 +2696,6 @@ class LeaderboardCog(commands.Cog):
             return
         mode_info = self.get_category_mode(guild.id, category)
 
-        def parse_override_values(mode: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-            if mode["type"] == "time":
-                winner_metric = self.parse_time(winner_value.strip())
-                loser_metric = self.parse_time(loser_value.strip())
-                if winner_metric is None or loser_metric is None:
-                    return None, "Invalid time format. Use MM:SS.sss or SS.sss"
-                return (
-                    {
-                        "winner_metric": winner_metric,
-                        "loser_metric": loser_metric,
-                        "winner_record_value": self.format_time_value(winner_metric),
-                        "loser_record_value": self.format_time_value(loser_metric),
-                    },
-                    None,
-                )
-            winner_score = self.parse_score(winner_value.strip())
-            loser_score = self.parse_score(loser_value.strip())
-            target = int(mode.get("target", 1))
-            if winner_score is None or loser_score is None:
-                return None, "Scores must be whole numbers."
-            if winner_score != target or loser_score >= target:
-                return None, f"Winning score must be {target}, and losing score must be less than {target}."
-            return (
-                {
-                    "winner_metric": float(winner_score),
-                    "loser_metric": float(loser_score),
-                    "winner_record_value": str(winner_score),
-                    "loser_record_value": str(loser_score),
-                    },
-                    None,
-                )
-
         if mode_key == "completed":
             if active_ref:
                 await interaction.followup.send(
@@ -2166,7 +2715,7 @@ class LeaderboardCog(commands.Cog):
                     ephemeral=True,
                 )
                 return
-            parsed_values, parse_error = parse_override_values(mode_info)
+            parsed_values, parse_error = self.parse_result_values(mode_info, winner_value, loser_value)
             if parsed_values is None:
                 await interaction.followup.send(parse_error or "Invalid result value.", ephemeral=True)
                 return
@@ -2191,6 +2740,10 @@ class LeaderboardCog(commands.Cog):
             original_winner_id = int(winner_row["user_id"])
             original_loser_id = int(loser_row["user_id"])
             original_participants = {original_winner_id, original_loser_id}
+            integrity_error = await self.ensure_history_integrity_for_replay(guild.id, category)
+            if integrity_error:
+                await interaction.followup.send(integrity_error, ephemeral=True)
+                return
             if winner is not None and loser is not None:
                 if winner.id == loser.id:
                     await interaction.followup.send("Winner and loser must be different players.", ephemeral=True)
@@ -2327,7 +2880,7 @@ class LeaderboardCog(commands.Cog):
             )
             return
         active_mode = self.normalize_mode_value(match.get("mode") or board_cfg.get("mode") or mode_info)
-        parsed_active_values, active_parse_error = parse_override_values(active_mode)
+        parsed_active_values, active_parse_error = self.parse_result_values(active_mode, winner_value, loser_value)
         if parsed_active_values is None:
             await interaction.followup.send(active_parse_error or "Invalid result value.", ephemeral=True)
             return
@@ -2388,6 +2941,11 @@ class LeaderboardCog(commands.Cog):
         )
         if not pair_rows:
             await interaction.followup.send("That historical match could not be found.", ephemeral=True)
+            return
+
+        integrity_error = await self.ensure_history_integrity_for_replay(guild.id, category)
+        if integrity_error:
+            await interaction.followup.send(integrity_error, ephemeral=True)
             return
 
         winner_row = pair_rows["winner"]
@@ -2517,6 +3075,203 @@ class LeaderboardCog(commands.Cog):
             ephemeral=True,
         )
 
+    @leaderboard.command(name="log-match")
+    @app_commands.describe(
+        category="Leaderboard name",
+        winner="Winner",
+        loser="Loser",
+        winner_value="Winner result",
+        loser_value="Loser result",
+        challenger="Optional challenger (defaults to winner)",
+        notes="Optional notes for the log",
+    )
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def log_match(
+        self,
+        interaction: discord.Interaction,
+        category: str,
+        winner: discord.Member,
+        loser: discord.Member,
+        winner_value: str,
+        loser_value: str,
+        challenger: Optional[discord.Member] = None,
+        notes: Optional[str] = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        if not self.has_mod_permissions(interaction.user):
+            await interaction.followup.send("You do not have permission to log matches.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.followup.send("Server-only command.", ephemeral=True)
+            return
+        guild = interaction.guild
+        gid = guild.id
+        board_cfg = self.get_leaderboard_config(gid, category)
+        if not board_cfg:
+            await interaction.followup.send("That leaderboard is not configured.", ephemeral=True)
+            return
+        if winner.id == loser.id:
+            await interaction.followup.send("Winner and loser must be different players.", ephemeral=True)
+            return
+        challenger_id = challenger.id if challenger else winner.id
+        if challenger_id not in {winner.id, loser.id}:
+            await interaction.followup.send("challenger must match either winner or loser.", ephemeral=True)
+            return
+        if self.is_player_banned_for_category(gid, category, winner.id):
+            await interaction.followup.send(f"{winner.display_name} is banned from this leaderboard.", ephemeral=True)
+            return
+        if self.is_player_banned_for_category(gid, category, loser.id):
+            await interaction.followup.send(f"{loser.display_name} is banned from this leaderboard.", ephemeral=True)
+            return
+
+        players = self.load_players_for(gid, category)
+        gid_s = str(gid)
+        safe_cat = normalize_category(category)
+        removed_map = self.removed.setdefault(gid_s, {}).setdefault(safe_cat, {})
+        inactive_labels: List[str] = []
+        for member in (winner, loser):
+            if member.id not in players or member.id in removed_map:
+                inactive_labels.append(member.display_name)
+        if inactive_labels:
+            await interaction.followup.send(
+                f"Both players must be active on this leaderboard. Inactive: {', '.join(inactive_labels)}.",
+                ephemeral=True,
+            )
+            return
+
+        active_pair = self.find_match_between(gid, category, winner.id, loser.id)
+        if active_pair:
+            await interaction.followup.send(
+                "An active match already exists between these players. Resolve or cancel it first.",
+                ephemeral=True,
+            )
+            return
+
+        mode_info = self.get_category_mode(gid, category)
+        parsed_values, parse_error = self.parse_result_values(mode_info, winner_value, loser_value)
+        if parsed_values is None:
+            await interaction.followup.send(parse_error or "Invalid result value.", ephemeral=True)
+            return
+        winner_metric = float(parsed_values["winner_metric"])
+        loser_metric = float(parsed_values["loser_metric"])
+        winner_record_value = str(parsed_values["winner_record_value"])
+        loser_record_value = str(parsed_values["loser_record_value"])
+
+        winner_stats = players[winner.id]
+        loser_stats = players[loser.id]
+        winner_old_elo = float(winner_stats["elo"])
+        loser_old_elo = float(loser_stats["elo"])
+        elo_delta = self.compute_elo_change(
+            mode_info,
+            winner_old_elo,
+            loser_old_elo,
+            winner_metric,
+            loser_metric,
+        )
+        winner_stats["wins"] += 1
+        loser_stats["losses"] += 1
+        winner_stats["elo"] = max(0.0, winner_old_elo + elo_delta)
+        loser_stats["elo"] = max(0.0, loser_old_elo - elo_delta)
+
+        self.players_data.setdefault(gid_s, {})[safe_cat] = players
+        await self.save_players_for(gid, category)
+
+        now = datetime.now(timezone.utc)
+        winner_match_row_id = await self.save_match_for(
+            gid,
+            category,
+            winner.id,
+            now,
+            loser.id,
+            winner.id == challenger_id,
+            winner_record_value,
+            loser_record_value,
+            "Win",
+            elo_delta,
+        )
+        loser_match_row_id = await self.save_match_for(
+            gid,
+            category,
+            loser.id,
+            now,
+            winner.id,
+            loser.id == challenger_id,
+            loser_record_value,
+            winner_record_value,
+            "Loss",
+            -elo_delta,
+        )
+
+        self.players_meta.setdefault(gid_s, {})[str(winner.id)] = {
+            "name": winner.display_name,
+            "avatar": winner.avatar.url if winner.avatar else None,
+        }
+        self.players_meta.setdefault(gid_s, {})[str(loser.id)] = {
+            "name": loser.display_name,
+            "avatar": loser.avatar.url if loser.avatar else None,
+        }
+        await self.persist_player_meta(gid)
+        await self.update_leaderboard_message_for(gid, category)
+
+        winner_rank_info = self.get_player_rank(gid, category, winner.id)
+        loser_rank_info = self.get_player_rank(gid, category, loser.id)
+        winner_rank = winner_rank_info[0] if winner_rank_info else None
+        loser_rank = loser_rank_info[0] if loser_rank_info else None
+        board_name = board_cfg.get("name", category)
+        detail = (
+            f"{winner_record_value} vs {loser_record_value}"
+            if mode_info["type"] == "time"
+            else f"{winner_record_value}-{loser_record_value}"
+        )
+        summary = f"{winner.mention} defeated {loser.mention} in {board_name} ({detail})."
+
+        announce_state = "unavailable"
+        announce_channel_id = board_cfg.get("announce_channel_id")
+        if announce_channel_id:
+            announce_channel = self.client.get_channel(announce_channel_id)
+            if announce_channel:
+                announce_embed = discord.Embed(
+                    title=f"{board_name} Result",
+                    color=discord.Color.green(),
+                    description=summary,
+                )
+                winner_field = f"{winner_stats['elo']:.1f} ({self.format_elo_delta(elo_delta)})"
+                loser_field = f"{loser_stats['elo']:.1f} ({self.format_elo_delta(-elo_delta)})"
+                if winner_rank:
+                    winner_field += f" (Rank #{winner_rank})"
+                if loser_rank:
+                    loser_field += f" (Rank #{loser_rank})"
+                announce_embed.add_field(name="Winner Elo", value=winner_field, inline=True)
+                announce_embed.add_field(name="Loser Elo", value=loser_field, inline=True)
+                announce_embed.add_field(name="Logged By", value=interaction.user.mention, inline=True)
+                if notes:
+                    announce_embed.add_field(name="Notes", value=notes, inline=False)
+                try:
+                    message = await announce_channel.send(embed=announce_embed)
+                    await asyncio.to_thread(
+                        self.storage.save_match_announcement,
+                        gid,
+                        category,
+                        winner_match_row_id,
+                        announce_channel.id,
+                        message.id,
+                    )
+                    announce_state = "posted"
+                except Exception:
+                    announce_state = "failed"
+
+        notes_text = notes if notes else "None"
+        await interaction.followup.send(
+            "Manual match logged. "
+            f"{winner.display_name} defeated {loser.display_name} ({detail}). "
+            f"Winner row id: {winner_match_row_id}. "
+            f"Loser row id: {loser_match_row_id}. "
+            f"Elo change: {self.format_elo_delta(elo_delta)} / {self.format_elo_delta(-elo_delta)}. "
+            f"Announcement: {announce_state}. "
+            f"Notes: {notes_text}",
+            ephemeral=True,
+        )
+
     @leaderboard.command(name="categories")
     async def categories(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -2531,12 +3286,22 @@ class LeaderboardCog(commands.Cog):
             players = self.load_players_for(gid, name)
             safe_cat = normalize_category(name)
             removed_map = self.removed.get(str(gid), {}).get(safe_cat, {})
-            active_players = [(uid, info) for uid, info in players.items() if uid not in removed_map]
+            ban_scopes = self.bans.get(str(gid), {})
+            global_banned = set(ban_scopes.get(GLOBAL_BAN_SCOPE, {}).keys()) if isinstance(ban_scopes.get(GLOBAL_BAN_SCOPE), dict) else set()
+            scoped_banned = set(ban_scopes.get(safe_cat, {}).keys()) if isinstance(ban_scopes.get(safe_cat), dict) else set()
+            banned_count = len(global_banned | scoped_banned)
+            active_players = [
+                (uid, info)
+                for uid, info in players.items()
+                if not self.is_hidden_from_leaderboard(gid, name, uid)
+            ]
             active_count = len(active_players)
             removed_count = len(removed_map)
             summary_parts = [f"{active_count} active"]
             if removed_count:
                 summary_parts.append(f"{removed_count} removed")
+            if banned_count:
+                summary_parts.append(f"{banned_count} banned")
             player_line = " | ".join(summary_parts)
             mode_label = self.mode_label(self.get_category_mode(gid, name))
             role = interaction.guild.get_role(data.get("participant_role_id")) if data.get("participant_role_id") else None
@@ -2554,6 +3319,10 @@ class LeaderboardCog(commands.Cog):
             cleanup_hours = cleanup_seconds / 3600
             timeout_state = "On" if bool(data.get("pending_timeout_enabled", True)) else "Off"
             anti_farm_state = "On" if bool(data.get("anti_farm_enabled", True)) else "Off"
+            decay_state = "On" if bool(data.get("inactivity_decay_enabled", INACTIVITY_DECAY_DEFAULT_ENABLED)) else "Off"
+            decay_days = max(1, int(data.get("inactivity_decay_days", INACTIVITY_DECAY_DEFAULT_DAYS)))
+            decay_amount = max(0.0, float(data.get("inactivity_decay_amount", INACTIVITY_DECAY_DEFAULT_AMOUNT)))
+            decay_floor = max(0.0, float(data.get("inactivity_decay_floor", INACTIVITY_DECAY_DEFAULT_FLOOR)))
             summary_lines = [
                 f"Players: {player_line}",
                 f"Mode: {mode_label}",
@@ -2564,6 +3333,7 @@ class LeaderboardCog(commands.Cog):
                 f"Announcements: {announce_target}",
                 f"Challenge Timeout: {timeout_state}",
                 f"Anti-Farm: {anti_farm_state}",
+                f"Inactivity Decay: {decay_state} ({decay_amount:.1f} every {decay_days}d, floor {decay_floor:.1f})",
                 f"Thread Cleanup: {cleanup_hours:.1f}h",
             ]
             if active_players:
@@ -2577,36 +3347,130 @@ class LeaderboardCog(commands.Cog):
     @leaderboard.command(name="help")
     async def help(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        embed = discord.Embed(title="Leaderboard Help", color=discord.Color.gold(), description="Quick reference for configuring and running competitions.")
+        embed = discord.Embed(
+            title="Leaderboard Help",
+            color=discord.Color.gold(),
+            description="Complete command and behavior guide for boards, matches, moderation, and automation.",
+        )
         embed.add_field(
-            name="Setup Checklist",
-            value="- /leaderboard setleaderboard to configure a board\n- /leaderboard editboard to adjust channels, mode, or rename later\n- /leaderboard categories to review setup and player counts",
+            name="Access Rules",
+            value=(
+                "- All commands are server-only\n"
+                "- Match/play commands require the board participant role\n"
+                "- Moderator commands require Manage Server or Administrator\n"
+                "- Removed or banned players cannot appear in ranked standings"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Board Setup",
+            value=(
+                "- /leaderboard setleaderboard creates or updates a board and posts the leaderboard message\n"
+                "- /leaderboard editboard updates board channels, mode, cleanup hours, and optional player stats\n"
+                "- /leaderboard remove-leaderboard deletes a board config and its posted message\n"
+                "- /leaderboard categories shows current board config state and top-player summary"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Challenge Lifecycle",
+            value=(
+                "- /leaderboard challenge opponent starts a direct challenge\n"
+                "- /leaderboard challenge anyone posts an open challenge queue entry\n"
+                "- /leaderboard challenge cancel cancels your own unresolved challenge\n"
+                "- Players accept/decline through the challenge message buttons"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Result Submission",
+            value=(
+                "- /leaderboard iwon and /leaderboard ilost submit completed results\n"
+                "- Matching submissions complete instantly and apply Elo/W-L\n"
+                "- Conflicting submissions set match status to disputed\n"
+                "- Unresolved/disputed matches are fixed with moderator tools"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Player Views",
+            value=(
+                "- /leaderboard profile [member]\n"
+                "- /leaderboard history [category] [player]\n"
+                "- /leaderboard activefights category:<board> scope:<all|personal>\n"
+                "- /leaderboard profilebio"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Analytics Commands",
+            value=(
+                "- /leaderboard stats ranks category:<board> [top] [member]\n"
+                "- /leaderboard stats headtohead player1:<member> player2:<member> [category]\n"
+                "- /leaderboard stats streaks [category] [member]"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Moderator Match Tools",
+            value=(
+                "- /leaderboard log-match writes a completed match even without an active challenge\n"
+                "- /leaderboard override mode:ongoing resolves unresolved active fights\n"
+                "- /leaderboard override mode:completed corrects historical match rows\n"
+                "- /leaderboard revoke removes a historical completed row and replays Elo\n"
+                "- /leaderboard cancelfight force-cancels an active pair"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Moderator Player Policy",
+            value=(
+                "- /leaderboard removeplayer and /leaderboard readd control board participation without deleting history\n"
+                "- /leaderboard player-ban action:<ban|unban|list> scope:<all|leaderboard>\n"
+                "- Global bans override board-specific unbans\n"
+                "- Ban actions cancel active unresolved matches in scope"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Automation and Decay",
+            value=(
+                "- /leaderboard challenge-timeout toggles pending direct challenge expiration\n"
+                "- /leaderboard anti-farm toggles opponent rotation enforcement on direct challenges\n"
+                "- /leaderboard inactivity-decay configures inactivity Elo decay (enabled by default on all boards)\n"
+                "- Inactivity decay sweeps automatically every 10 minutes\n"
+                "- /leaderboard inactivity-decay ... apply_now:true runs an immediate decay pass\n"
+                "- /leaderboard purge-threads deletes inactive challenge threads"
+            ),
             inline=False,
         )
         mode_lines = []
         for key, data in MODES.items():
             if data["type"] == "time":
-                desc = "Track fastest completion times. Log winner and loser times."
+                desc = "Winner is lowest time (format MM:SS.sss or SS.sss)."
             else:
-                desc = "First to a chosen score. Set the winning score through /leaderboard editboard mode_target:<number>."
-            mode_lines.append(f"{data['label']}: {desc}")
-        embed.add_field(name="Modes", value="\n".join(mode_lines), inline=False)
+                desc = "Winner must hit target score; loser must be below target."
+            mode_lines.append(f"- {data['label']}: {desc}")
         embed.add_field(
-            name="Editing & Maintenance",
-            value="- /leaderboard editboard player:<member> to tweak stats\n- /leaderboard editboard leaderboard_channel:<channel> to move the board message\n- /leaderboard editboard mode:<mode> mode_target:<score> for rule updates\n- /leaderboard challenge-timeout category:<board> enabled:<true/false>\n- /leaderboard anti-farm category:<board> enabled:<true/false>\n- /leaderboard removeplayer or /leaderboard readd to manage roster",
+            name="Scoring Modes",
+            value=(
+                "- Time boards: lower time wins\n"
+                "- Score boards: winner must hit board target, loser must stay below target\n"
+                + ("\n" + "\n".join(mode_lines) if mode_lines else "")
+            ),
             inline=False,
         )
         embed.add_field(
-            name="Logging Results",
-            value="- Use /leaderboard challenge opponent or /leaderboard challenge anyone to post a match\n- Players submit with /leaderboard iwon and /leaderboard ilost\n- Use /leaderboard override mode:ongoing active_ref:<match> winner:<player> loser:<player>\n- Use /leaderboard override mode:completed match_ref:<historical> (winner/loser optional)\n- Use /leaderboard revoke match_ref:<historical> to remove a completed match and replay Elo",
+            name="Important Behavior Notes",
+            value=(
+                "- Bans and removals hide players from rank positions but preserve historical stats\n"
+                "- Historical corrections and revokes replay Elo from saved match history\n"
+                "- Manual log-match entries are treated as completed history and support later revoke/override flows\n"
+                "- If announcements are configured, completed matches post result embeds automatically"
+            ),
             inline=False,
         )
-        embed.add_field(
-            name="Viewing Data",
-            value="- /leaderboard profile for player stats\n- /leaderboard history for server-wide results\n- /leaderboard activefights to monitor ongoing matches",
-            inline=False,
-        )
-        embed.set_footer(text="DM oddsnothere for help or to request features :)")
+        embed.set_footer(text="Use /leaderboard categories to verify live board settings and status.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @leaderboard.command(name="setleaderboard")
@@ -2691,6 +3555,10 @@ class LeaderboardCog(commands.Cog):
             "announce_channel_id": announcement_channel.id if announcement_channel else (previous.get("announce_channel_id") if previous else None),
             "pending_timeout_enabled": previous.get("pending_timeout_enabled", True) if previous else True,
             "anti_farm_enabled": previous.get("anti_farm_enabled", True) if previous else True,
+            "inactivity_decay_enabled": previous.get("inactivity_decay_enabled", INACTIVITY_DECAY_DEFAULT_ENABLED) if previous else INACTIVITY_DECAY_DEFAULT_ENABLED,
+            "inactivity_decay_days": previous.get("inactivity_decay_days", INACTIVITY_DECAY_DEFAULT_DAYS) if previous else INACTIVITY_DECAY_DEFAULT_DAYS,
+            "inactivity_decay_amount": previous.get("inactivity_decay_amount", INACTIVITY_DECAY_DEFAULT_AMOUNT) if previous else INACTIVITY_DECAY_DEFAULT_AMOUNT,
+            "inactivity_decay_floor": previous.get("inactivity_decay_floor", INACTIVITY_DECAY_DEFAULT_FLOOR) if previous else INACTIVITY_DECAY_DEFAULT_FLOOR,
             "thread_cleanup_seconds": cleanup_seconds,
             "mode": {"key": mode_info["key"], "target": mode_info["target"]} if mode_info else (previous.get("mode") if previous else None),
         }
@@ -2735,6 +3603,7 @@ class LeaderboardCog(commands.Cog):
         self.players_data.get(gid_s, {}).pop(safe, None)
         self.bios.get(gid_s, {}).pop(safe, None)
         self.removed.get(gid_s, {}).pop(safe, None)
+        self.decay_state.get(gid_s, {}).pop(safe, None)
         bucket = self.active_fights.get(gid_s, {})
         if name in bucket:
             bucket.pop(name, None)
@@ -2816,6 +3685,9 @@ class LeaderboardCog(commands.Cog):
                 removed_map = self.removed.setdefault(gid_s, {})
                 if old_safe in removed_map:
                     removed_map[new_safe] = removed_map.pop(old_safe)
+                decay_map = self.decay_state.setdefault(gid_s, {})
+                if old_safe in decay_map:
+                    decay_map[new_safe] = decay_map.pop(old_safe)
                 fights_map = self.active_fights.setdefault(gid_s, {})
                 if current_name in fights_map:
                     fights_map[new_name_clean] = fights_map.pop(current_name)
@@ -3000,6 +3872,81 @@ class LeaderboardCog(commands.Cog):
             ephemeral=True,
         )
 
+    @leaderboard.command(name="inactivity-decay")
+    @app_commands.describe(
+        category="Leaderboard name",
+        enabled="Enable or disable inactivity decay",
+        days="Days of inactivity per decay window",
+        amount="Elo deducted each window",
+        floor="Minimum Elo decay can reach",
+        apply_now="Apply current decay settings immediately",
+    )
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def inactivity_decay(
+        self,
+        interaction: discord.Interaction,
+        category: str,
+        enabled: Optional[bool] = None,
+        days: Optional[int] = None,
+        amount: Optional[float] = None,
+        floor: Optional[float] = None,
+        apply_now: Optional[bool] = False,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.guild is None:
+            return await interaction.followup.send("Server-only command.", ephemeral=True)
+        if not self.has_mod_permissions(interaction.user):
+            return await interaction.followup.send("You do not have permission.", ephemeral=True)
+        gid = interaction.guild.id
+        board_cfg = self.get_leaderboard_config(gid, category)
+        if not board_cfg:
+            return await interaction.followup.send("That leaderboard is not configured.", ephemeral=True)
+
+        changed = False
+        if enabled is not None:
+            board_cfg["inactivity_decay_enabled"] = bool(enabled)
+            changed = True
+        if days is not None:
+            if int(days) < 1:
+                return await interaction.followup.send("days must be at least 1.", ephemeral=True)
+            board_cfg["inactivity_decay_days"] = int(days)
+            changed = True
+        if amount is not None:
+            if float(amount) < 0:
+                return await interaction.followup.send("amount must be 0 or greater.", ephemeral=True)
+            board_cfg["inactivity_decay_amount"] = float(amount)
+            changed = True
+        if floor is not None:
+            if float(floor) < 0:
+                return await interaction.followup.send("floor must be 0 or greater.", ephemeral=True)
+            board_cfg["inactivity_decay_floor"] = float(floor)
+            changed = True
+
+        if changed:
+            board_cfg = self.upsert_leaderboard_config(gid, category, board_cfg)
+
+        decay_result = None
+        if apply_now:
+            decay_result = await self.apply_inactivity_decay_for_board(gid, category, now=datetime.now(timezone.utc))
+
+        state = "ON" if bool(board_cfg.get("inactivity_decay_enabled", INACTIVITY_DECAY_DEFAULT_ENABLED)) else "OFF"
+        config_line = (
+            f"Inactivity decay is {state} for {board_cfg.get('name', category)}. "
+            f"{int(board_cfg.get('inactivity_decay_days', INACTIVITY_DECAY_DEFAULT_DAYS))} day window, "
+            f"{float(board_cfg.get('inactivity_decay_amount', INACTIVITY_DECAY_DEFAULT_AMOUNT)):.1f} Elo per window, "
+            f"floor {float(board_cfg.get('inactivity_decay_floor', INACTIVITY_DECAY_DEFAULT_FLOOR)):.1f}."
+        )
+        if decay_result is None:
+            if changed:
+                return await interaction.followup.send(f"Updated. {config_line}", ephemeral=True)
+            return await interaction.followup.send(config_line, ephemeral=True)
+
+        await interaction.followup.send(
+            f"{config_line} Applied now: {decay_result['changed_players']} player(s) decayed, "
+            f"total Elo reduced {decay_result['total_decay']:.1f}.",
+            ephemeral=True,
+        )
+
     @challenge_group.command(name="anyone")
     @app_commands.describe(category="Leaderboard name", rank_range="Rank window", automatch="Try to auto-match with an existing open challenge")
     @app_commands.autocomplete(category=category_autocomplete)
@@ -3012,6 +3959,8 @@ class LeaderboardCog(commands.Cog):
         board_cfg = self.get_leaderboard_config(gid, category)
         if not board_cfg:
             return await interaction.followup.send("Leaderboard not configured. Use /leaderboard setleaderboard first.", ephemeral=True)
+        if self.is_player_banned_for_category(gid, category, interaction.user.id):
+            return await interaction.followup.send("You are banned from this leaderboard.", ephemeral=True)
         role_id = board_cfg.get("participant_role_id")
         if role_id and role_id not in [role.id for role in interaction.user.roles]:
             return await interaction.followup.send("You need the participant role to issue challenges.", ephemeral=True)
@@ -3027,6 +3976,17 @@ class LeaderboardCog(commands.Cog):
                     continue
                 if m.get("challenger_id") == interaction.user.id:
                     continue
+                challenger_id = self._coerce_member_id(m.get("challenger_id"))
+                if challenger_id is None:
+                    continue
+                if self.is_player_banned_for_category(gid, category, challenger_id):
+                    await self._cancel_match_with_embed_update(
+                        gid,
+                        category,
+                        mid,
+                        reason="Cancelled automatically: a participant is banned from this leaderboard.",
+                    )
+                    continue
                 other_rank = self.get_player_rank(gid, category, m.get("challenger_id"))
                 if challenger_rank and other_rank:
                     diff = abs(challenger_rank[0] - other_rank[0])
@@ -3037,9 +3997,6 @@ class LeaderboardCog(commands.Cog):
                         window_ok = window_ok and diff <= int(rank_range)
                     if not window_ok:
                         continue
-                challenger_id = self._coerce_member_id(m.get("challenger_id"))
-                if challenger_id is None:
-                    continue
                 blocked, _ = await self.is_anti_farm_blocked(gid, category, challenger_id, interaction.user.id)
                 if blocked:
                     continue
@@ -3147,6 +4104,8 @@ class LeaderboardCog(commands.Cog):
         board_cfg = self.get_leaderboard_config(gid, category)
         if not board_cfg:
             return await interaction.followup.send("Leaderboard not configured. Use /leaderboard setleaderboard first.", ephemeral=True)
+        if self.is_player_banned_for_category(gid, category, interaction.user.id):
+            return await interaction.followup.send("You are banned from this leaderboard.", ephemeral=True)
         role_id = board_cfg.get("participant_role_id")
         if role_id and role_id not in [role.id for role in interaction.user.roles]:
             return await interaction.followup.send("You need the participant role to issue challenges.", ephemeral=True)
@@ -3154,6 +4113,8 @@ class LeaderboardCog(commands.Cog):
             return await interaction.followup.send("You already have an active challenge.", ephemeral=True)
         if opponent.id == interaction.user.id:
             return await interaction.followup.send("You cannot challenge yourself.", ephemeral=True)
+        if self.is_player_banned_for_category(gid, category, opponent.id):
+            return await interaction.followup.send(f"{opponent.display_name} is banned from this leaderboard.", ephemeral=True)
         if role_id and role_id not in [role.id for role in opponent.roles]:
             return await interaction.followup.send(f"{opponent.display_name} is not registered for this leaderboard.", ephemeral=True)
         opponent_blocking = self.find_blocking_in_progress_match_for(gid, opponent.id)
@@ -3215,6 +4176,214 @@ class LeaderboardCog(commands.Cog):
         }
         await self.persist_player_meta(gid)
         await interaction.followup.send(f"Challenge posted in {channel.mention}.", ephemeral=True)
+
+    @leaderboard.command(name="player-ban")
+    @app_commands.describe(
+        action="Ban action",
+        scope="Ban scope",
+        player="Player to target (required for ban/unban)",
+        category="Leaderboard name (required when scope=Specific Leaderboard)",
+        reason="Optional reason (used on ban)",
+    )
+    @app_commands.choices(action=PLAYER_BAN_ACTION_CHOICES, scope=PLAYER_BAN_SCOPE_CHOICES)
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def player_ban(
+        self,
+        interaction: discord.Interaction,
+        action: app_commands.Choice[str],
+        scope: app_commands.Choice[str],
+        player: Optional[discord.Member] = None,
+        category: Optional[str] = None,
+        reason: Optional[str] = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.guild is None:
+            return await interaction.followup.send("Server-only command.", ephemeral=True)
+        if not self.has_mod_permissions(interaction.user):
+            return await interaction.followup.send("You do not have permission.", ephemeral=True)
+
+        action_key = str(action.value).strip().lower()
+        scope_key = str(scope.value).strip().lower()
+        if action_key not in {"ban", "unban", "list"}:
+            return await interaction.followup.send("Invalid action.", ephemeral=True)
+        if scope_key not in {"all", "leaderboard"}:
+            return await interaction.followup.send("Invalid scope.", ephemeral=True)
+
+        gid = interaction.guild.id
+        gid_s = str(gid)
+        scope_category_name: Optional[str] = None
+        scope_storage_key = self._effective_scope_key_for(scope_key)
+        if scope_key == "leaderboard":
+            if not category:
+                return await interaction.followup.send("category is required when scope is Specific Leaderboard.", ephemeral=True)
+            board_cfg = self.get_leaderboard_config(gid, category)
+            if not board_cfg:
+                return await interaction.followup.send("That leaderboard is not configured.", ephemeral=True)
+            scope_category_name = board_cfg.get("name", category)
+            scope_storage_key = self._effective_scope_key_for(scope_key, scope_category_name)
+        if scope_storage_key is None:
+            return await interaction.followup.send("Unable to resolve ban scope.", ephemeral=True)
+
+        if action_key in {"ban", "unban"} and player is None:
+            return await interaction.followup.send("player is required for ban and unban actions.", ephemeral=True)
+
+        self.bans.setdefault(gid_s, {})
+        ban_scopes = self.bans[gid_s]
+
+        if action_key == "list":
+            filter_user_id = player.id if player else None
+            lines: List[str] = []
+            sortable: List[Tuple[datetime, str]] = []
+            for stored_scope, users in ban_scopes.items():
+                if not isinstance(users, dict):
+                    continue
+                if stored_scope != scope_storage_key:
+                    continue
+                for banned_user_id, payload in users.items():
+                    if filter_user_id is not None and int(banned_user_id) != int(filter_user_id):
+                        continue
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    banned_at_raw = str(payload.get("banned_at") or "")
+                    try:
+                        banned_at = datetime.fromisoformat(banned_at_raw)
+                        if banned_at.tzinfo is None:
+                            banned_at = banned_at.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        banned_at = datetime.now(timezone.utc)
+                    stamp = banned_at.astimezone(TZ).strftime("%Y-%m-%d %H:%M")
+                    if stored_scope == GLOBAL_BAN_SCOPE:
+                        scope_label = "All Leaderboards"
+                    else:
+                        board_cfg = self.get_leaderboard_config(gid, stored_scope)
+                        scope_label = board_cfg.get("name", stored_scope.replace("_", " ").title()) if board_cfg else stored_scope.replace("_", " ").title()
+                    target_user = interaction.guild.get_member(int(banned_user_id)) or self.client.get_user(int(banned_user_id))
+                    target_label = target_user.display_name if target_user else self.user_snapshot_name_for(gid, int(banned_user_id))
+                    banned_by = payload.get("banned_by")
+                    moderator_label = "Unknown"
+                    if banned_by is not None:
+                        try:
+                            moderator_id = int(banned_by)
+                        except Exception:
+                            moderator_id = None
+                        if moderator_id is not None:
+                            moderator_obj = interaction.guild.get_member(moderator_id) or self.client.get_user(moderator_id)
+                            moderator_label = moderator_obj.display_name if moderator_obj else self.user_snapshot_name_for(gid, moderator_id)
+                    reason_text = str(payload.get("reason") or "No reason provided")
+                    sortable.append(
+                        (
+                            banned_at,
+                            f"[{scope_label}] {target_label} | by {moderator_label} | {stamp} | {reason_text}",
+                        )
+                    )
+            sortable.sort(key=lambda item: item[0], reverse=True)
+            lines = [line for _, line in sortable]
+            if not lines:
+                return await interaction.followup.send("No bans found for the selected filters.", ephemeral=True)
+            pages = chunk_list(lines, 10)
+            scope_text = "All Leaderboards" if scope_storage_key == GLOBAL_BAN_SCOPE else (scope_category_name or "Unknown")
+            header = f"Scope: {scope_text}"
+            if player:
+                header = f"{header}\nPlayer: {player.display_name}"
+            view = PagedListView(
+                title="Player Bans",
+                pages=pages,
+                color=discord.Color.red(),
+                footer_note=f"{len(lines)} ban(s)",
+                header=header,
+            )
+            return await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=True)
+
+        assert player is not None
+        scope_label = "all leaderboards" if scope_storage_key == GLOBAL_BAN_SCOPE else (scope_category_name or "selected leaderboard")
+        if action_key == "ban":
+            target_bucket = self._ban_bucket_for_scope(gid, scope_storage_key)
+            now = datetime.now(timezone.utc).isoformat()
+            already_banned = player.id in target_bucket
+            target_bucket[player.id] = {
+                "reason": reason.strip() if isinstance(reason, str) and reason.strip() else None,
+                "banned_by": interaction.user.id,
+                "banned_at": now,
+            }
+            await self.save_bans_for(gid)
+            target_categories = self.iter_scoped_categories_for_ban(gid, scope_key, scope_category_name)
+            cancelled_matches = 0
+            active_categories = self.active_fights.get(gid_s, {})
+            if scope_key == "all":
+                active_targets = list(active_categories.keys())
+            else:
+                scope_lower = str(scope_category_name or "").lower()
+                active_targets = [name for name in active_categories.keys() if str(name).lower() == scope_lower]
+            for board_name in active_targets:
+                bucket = active_categories.get(board_name)
+                if not isinstance(bucket, dict):
+                    continue
+                matches = bucket.get("matches", {})
+                if not isinstance(matches, dict):
+                    continue
+                for match_id, match in list(matches.items()):
+                    status = str(match.get("status") or "open")
+                    if status in {"completed", "cancelled"}:
+                        continue
+                    participants = {
+                        self._coerce_member_id(match.get("challenger_id")),
+                        self._coerce_member_id(match.get("opponent_id")),
+                    }
+                    if player.id not in participants:
+                        continue
+                    cancelled = await self._cancel_match_with_embed_update(
+                        gid,
+                        board_name,
+                        match_id,
+                        reason=f"Cancelled automatically: {player.display_name} was banned by moderator {interaction.user.display_name}.",
+                    )
+                    if cancelled:
+                        cancelled_matches += 1
+            refreshed = 0
+            for board_name in target_categories:
+                await self.update_leaderboard_message_for(gid, board_name)
+                refreshed += 1
+            global_still_note = ""
+            if scope_storage_key != GLOBAL_BAN_SCOPE and player.id in ban_scopes.get(GLOBAL_BAN_SCOPE, {}):
+                global_still_note = " Global ban is also active for this player."
+            status_text = "Updated ban record." if already_banned else "Ban applied."
+            return await interaction.followup.send(
+                f"{status_text} Scope: {scope_label}. Cancelled matches: {cancelled_matches}. Refreshed boards: {refreshed}.{global_still_note}",
+                ephemeral=True,
+            )
+
+        # action_key == "unban"
+        target_bucket = ban_scopes.get(scope_storage_key, {})
+        if not isinstance(target_bucket, dict):
+            target_bucket = {}
+        if player.id not in target_bucket:
+            still_global = (
+                scope_storage_key != GLOBAL_BAN_SCOPE
+                and player.id in ban_scopes.get(GLOBAL_BAN_SCOPE, {})
+            )
+            note = " Global ban is still active." if still_global else ""
+            return await interaction.followup.send(
+                f"{player.display_name} is not banned in {scope_label}.{note}",
+                ephemeral=True,
+            )
+        target_bucket.pop(player.id, None)
+        if not target_bucket:
+            ban_scopes.pop(scope_storage_key, None)
+        await self.save_bans_for(gid)
+        target_categories = self.iter_scoped_categories_for_ban(gid, scope_key, scope_category_name)
+        refreshed = 0
+        for board_name in target_categories:
+            await self.update_leaderboard_message_for(gid, board_name)
+            refreshed += 1
+        still_global = (
+            scope_storage_key != GLOBAL_BAN_SCOPE
+            and player.id in ban_scopes.get(GLOBAL_BAN_SCOPE, {})
+        )
+        note = " Global ban is still active for this player." if still_global else ""
+        await interaction.followup.send(
+            f"Unbanned {player.display_name} from {scope_label}. Refreshed boards: {refreshed}.{note}",
+            ephemeral=True,
+        )
 
     @leaderboard.command(name="removeplayer")
     @app_commands.describe(category="Leaderboard name", player="Player to remove")
@@ -3406,6 +4575,323 @@ class LeaderboardCog(commands.Cog):
             color=discord.Color.blue(),
             footer_note=f"{len(entries)} matches",
             header=header_text,
+        )
+        await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=True)
+
+    @stats_group.command(name="headtohead")
+    @app_commands.describe(
+        player1="First player",
+        player2="Second player",
+        category="Optional leaderboard filter",
+    )
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def headtohead(
+        self,
+        interaction: discord.Interaction,
+        player1: discord.Member,
+        player2: discord.Member,
+        category: Optional[str] = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.guild is None:
+            return await interaction.followup.send("Server-only command.", ephemeral=True)
+        if player1.id == player2.id:
+            return await interaction.followup.send("Select two different players.", ephemeral=True)
+        gid = interaction.guild.id
+        boards: List[str] = []
+        if category:
+            boards = [category]
+        else:
+            boards.extend(self.list_leaderboards(gid))
+            boards.extend(self.storage.list_categories(gid))
+        boards = [name for name in dict.fromkeys(board for board in boards if board)]
+        if not boards:
+            return await interaction.followup.send("No leaderboards configured.", ephemeral=True)
+
+        rows_by_board: List[Tuple[datetime, str, int, int, float, float]] = []
+        wins_1 = 0
+        wins_2 = 0
+        net_elo_1 = 0.0
+        net_elo_2 = 0.0
+        board_errors: List[str] = []
+        for board_name in boards:
+            try:
+                rows = await asyncio.to_thread(
+                    self.storage.load_recent_pair_matches,
+                    gid,
+                    board_name,
+                    player1.id,
+                    player2.id,
+                    250,
+                )
+            except Exception as exc:
+                rows = []
+                logger.warning("Head-to-head primary lookup failed for guild %s board %s: %s", gid, board_name, exc)
+                if self._is_database_corruption_error(exc):
+                    board_errors.append(board_name)
+            if not rows:
+                try:
+                    history_rows = await asyncio.to_thread(self.storage.load_match_history, gid, board_name)
+                except Exception as exc:
+                    logger.warning("Head-to-head fallback lookup failed for guild %s board %s: %s", gid, board_name, exc)
+                    if self._is_database_corruption_error(exc):
+                        board_errors.append(board_name)
+                    continue
+                loss_index: Dict[Tuple[str, int, int], List[float]] = {}
+                for hrow in history_rows:
+                    if str(hrow.get("result") or "") != "Loss":
+                        continue
+                    try:
+                        loser_id = int(hrow.get("user_id"))
+                        winner_id = int(hrow.get("opponent_id"))
+                    except Exception:
+                        continue
+                    key = (str(hrow.get("date") or ""), loser_id, winner_id)
+                    try:
+                        loss_delta = float(hrow.get("elo_change") or 0.0)
+                    except Exception:
+                        loss_delta = 0.0
+                    loss_index.setdefault(key, []).append(loss_delta)
+                rebuilt_rows: List[Dict[str, Any]] = []
+                for hrow in reversed(history_rows):
+                    token = str(hrow.get("result") or "")
+                    if token not in {"Win", "DeclineWin"}:
+                        continue
+                    try:
+                        winner_id = int(hrow.get("user_id"))
+                        loser_id = int(hrow.get("opponent_id"))
+                    except Exception:
+                        continue
+                    if {winner_id, loser_id} != {player1.id, player2.id}:
+                        continue
+                    try:
+                        winner_delta = float(hrow.get("elo_change") or 0.0)
+                    except Exception:
+                        winner_delta = 0.0
+                    loss_key = (str(hrow.get("date") or ""), loser_id, winner_id)
+                    candidates = loss_index.get(loss_key, [])
+                    loser_delta = float(candidates.pop()) if candidates else -winner_delta
+                    rebuilt_rows.append(
+                        {
+                            "recorded_at": hrow.get("date"),
+                            "winner_id": winner_id,
+                            "loser_id": loser_id,
+                            "winner_value": hrow.get("time"),
+                            "loser_value": hrow.get("opponent_time"),
+                            "winner_elo_change": winner_delta,
+                            "loser_elo_change": loser_delta,
+                        }
+                    )
+                    if len(rebuilt_rows) >= 250:
+                        break
+                rows = rebuilt_rows
+            mode_info = self.get_category_mode(gid, board_name)
+            for row in rows:
+                winner_id = int(row["winner_id"])
+                loser_id = int(row["loser_id"])
+                winner_delta = float(row.get("winner_elo_change", 0.0))
+                loser_delta = float(row.get("loser_elo_change", 0.0))
+                if winner_id == player1.id:
+                    wins_1 += 1
+                    net_elo_1 += winner_delta
+                    net_elo_2 += loser_delta
+                else:
+                    wins_2 += 1
+                    net_elo_1 += loser_delta
+                    net_elo_2 += winner_delta
+                when_dt = self._parse_recorded_datetime(row.get("recorded_at")) or datetime.now(timezone.utc)
+                stamp = when_dt.astimezone(TZ).strftime("%m/%d/%Y %H:%M")
+                if mode_info["type"] == "time":
+                    detail = f"{row.get('winner_value', '?')} vs {row.get('loser_value', '?')}"
+                else:
+                    detail = f"{row.get('winner_value', '?')}-{row.get('loser_value', '?')}"
+                winner_name = self.user_snapshot_name_for(gid, winner_id)
+                loser_name = self.user_snapshot_name_for(gid, loser_id)
+                board_prefix = f"[{board_name}] " if not category else ""
+                line = f"{stamp} - {board_prefix}{winner_name} defeated {loser_name} ({detail})"
+                rows_by_board.append((when_dt, line, winner_id, loser_id, winner_delta, loser_delta))
+        if not rows_by_board:
+            if board_errors:
+                return await interaction.followup.send(
+                    "Unable to read match history due database corruption. Run SQLite integrity/repair on the leaderboard DB, then retry.",
+                    ephemeral=True,
+                )
+            return await interaction.followup.send("No matches found for this player pair.", ephemeral=True)
+        rows_by_board.sort(key=lambda item: item[0], reverse=True)
+        lines = [item[1] for item in rows_by_board]
+        total_matches = len(rows_by_board)
+        win_pct_1 = (wins_1 / total_matches) * 100 if total_matches else 0.0
+        win_pct_2 = (wins_2 / total_matches) * 100 if total_matches else 0.0
+        summary = (
+            f"{player1.display_name}: {wins_1} wins ({win_pct_1:.1f}%) | Net Elo {self.format_elo_delta(net_elo_1)}\n"
+            f"{player2.display_name}: {wins_2} wins ({win_pct_2:.1f}%) | Net Elo {self.format_elo_delta(net_elo_2)}\n"
+            f"Total matches: {total_matches}"
+        )
+        pages = chunk_list(lines, 10)
+        title_suffix = category if category else "All Leaderboards"
+        view = PagedListView(
+            title=f"Head-to-Head: {player1.display_name} vs {player2.display_name}",
+            pages=pages,
+            color=discord.Color.blurple(),
+            footer_note=f"{total_matches} matches",
+            header=f"Scope: {title_suffix}\n{summary}",
+        )
+        await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=True)
+
+    @stats_group.command(name="streaks")
+    @app_commands.describe(
+        category="Optional leaderboard filter",
+        member="Optional member (defaults to you)",
+    )
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def streaks(self, interaction: discord.Interaction, category: Optional[str] = None, member: Optional[discord.Member] = None):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.guild is None:
+            return await interaction.followup.send("Server-only command.", ephemeral=True)
+        gid = interaction.guild.id
+        target = member or interaction.user
+        avatar_url = self.user_snapshot_avatar_for(gid, target.id)
+        if not avatar_url and getattr(target, "display_avatar", None):
+            avatar_url = target.display_avatar.url
+
+        if category:
+            boards = [category]
+        else:
+            boards = self.list_leaderboards(gid)
+            boards.extend(self.storage.list_categories(gid))
+            boards = [name for name in dict.fromkeys(board for board in boards if board)]
+        if not boards:
+            return await interaction.followup.send("No leaderboards configured.", ephemeral=True)
+
+        if category:
+            rows = await asyncio.to_thread(self.storage.load_match_history, gid, category)
+            streak = self.compute_member_streaks(rows, target.id)
+            if streak["matches"] == 0:
+                return await interaction.followup.send("No recorded matches for that player in this leaderboard.", ephemeral=True)
+            current_prefix = "W" if streak["current_type"] == "W" else "L"
+            current_text = f"{current_prefix}{streak['current_count']}" if streak["current_type"] else "None"
+            last_seen = (
+                streak["last_match_at"].astimezone(TZ).strftime("%m/%d/%Y %H:%M")
+                if streak["last_match_at"]
+                else "Unknown"
+            )
+            embed = discord.Embed(
+                title=f"Streaks - {target.display_name}",
+                description=f"Leaderboard: {category}",
+                color=discord.Color.blue(),
+            )
+            if avatar_url:
+                embed.set_thumbnail(url=avatar_url)
+            embed.add_field(name="Current Streak", value=current_text, inline=True)
+            embed.add_field(name="Best Win Streak", value=str(streak["best_win"]), inline=True)
+            embed.add_field(name="Best Loss Streak", value=str(streak["best_loss"]), inline=True)
+            embed.add_field(name="Matches Counted", value=str(streak["matches"]), inline=True)
+            embed.add_field(name="Last Match", value=last_seen, inline=True)
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+
+        lines: List[str] = []
+        best_win_board: Optional[Tuple[str, int]] = None
+        best_current_board: Optional[Tuple[str, str, int]] = None
+        total_matches = 0
+        for board_name in boards:
+            try:
+                rows = await asyncio.to_thread(self.storage.load_match_history, gid, board_name)
+            except Exception:
+                continue
+            streak = self.compute_member_streaks(rows, target.id)
+            if streak["matches"] == 0:
+                continue
+            total_matches += int(streak["matches"])
+            current_prefix = "W" if streak["current_type"] == "W" else "L"
+            current_text = f"{current_prefix}{streak['current_count']}" if streak["current_type"] else "None"
+            lines.append(
+                f"[{board_name}] Current {current_text} | Best W{streak['best_win']} | Best L{streak['best_loss']} | Matches {streak['matches']}"
+            )
+            if best_win_board is None or int(streak["best_win"]) > best_win_board[1]:
+                best_win_board = (board_name, int(streak["best_win"]))
+            if streak["current_type"]:
+                if best_current_board is None or int(streak["current_count"]) > best_current_board[2]:
+                    best_current_board = (board_name, str(streak["current_type"]), int(streak["current_count"]))
+        if not lines:
+            return await interaction.followup.send("No recorded matches for that player.", ephemeral=True)
+        pages = chunk_list(lines, 10)
+        header_parts = [f"Player: {target.display_name}", f"Boards with data: {len(lines)}", f"Matches counted: {total_matches}"]
+        if best_win_board:
+            header_parts.append(f"Best win streak: W{best_win_board[1]} in {best_win_board[0]}")
+        if best_current_board:
+            header_parts.append(
+                f"Longest current streak: {best_current_board[1]}{best_current_board[2]} in {best_current_board[0]}"
+            )
+        view = PagedListView(
+            title=f"Streaks - {target.display_name}",
+            pages=pages,
+            color=discord.Color.blue(),
+            footer_note=f"{len(lines)} board entries",
+            header="\n".join(header_parts),
+            thumbnail=avatar_url,
+        )
+        await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=True)
+
+    @stats_group.command(name="ranks")
+    @app_commands.describe(
+        category="Leaderboard name",
+        top="How many top rows to show (1-50)",
+        member="Optional member to center around",
+    )
+    @app_commands.autocomplete(category=category_autocomplete)
+    async def ranks(self, interaction: discord.Interaction, category: str, top: Optional[int] = 10, member: Optional[discord.Member] = None):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.guild is None:
+            return await interaction.followup.send("Server-only command.", ephemeral=True)
+        gid = interaction.guild.id
+        board_cfg = self.get_leaderboard_config(gid, category)
+        if not board_cfg:
+            return await interaction.followup.send("That leaderboard is not configured.", ephemeral=True)
+        try:
+            top_n = max(1, min(50, int(top if top is not None else 10)))
+        except Exception:
+            top_n = 10
+
+        players = self.load_players_for(gid, category)
+        ranked = sorted(
+            ((uid, data) for uid, data in players.items() if not self.is_hidden_from_leaderboard(gid, category, uid)),
+            key=lambda item: item[1]["elo"],
+            reverse=True,
+        )
+        if not ranked:
+            return await interaction.followup.send("No ranked players found for this leaderboard.", ephemeral=True)
+        lines: List[str] = []
+        if member:
+            target_index = None
+            for idx, (uid, _) in enumerate(ranked):
+                if uid == member.id:
+                    target_index = idx
+                    break
+            if target_index is None:
+                return await interaction.followup.send(f"{member.display_name} is not currently ranked in this leaderboard.", ephemeral=True)
+            start = max(0, target_index - 3)
+            end = min(len(ranked), target_index + 4)
+            for rank_idx in range(start, end):
+                uid, stats = ranked[rank_idx]
+                label = self.user_snapshot_name_for(gid, uid)
+                marker = " <- target" if uid == member.id else ""
+                lines.append(
+                    f"#{rank_idx + 1} {label} | Elo {stats['elo']:.1f} | W:{stats['wins']} L:{stats['losses']}{marker}"
+                )
+            title = f"Ranks Around {member.display_name} - {board_cfg.get('name', category)}"
+            footer_note = f"Showing {len(lines)} rows"
+        else:
+            for rank_idx, (uid, stats) in enumerate(ranked[:top_n], start=1):
+                label = self.user_snapshot_name_for(gid, uid)
+                lines.append(f"#{rank_idx} {label} | Elo {stats['elo']:.1f} | W:{stats['wins']} L:{stats['losses']}")
+            title = f"Top {top_n} - {board_cfg.get('name', category)}"
+            footer_note = f"{len(ranked)} total ranked"
+        pages = chunk_list(lines, 10)
+        view = PagedListView(
+            title=title,
+            pages=pages,
+            color=discord.Color.gold(),
+            footer_note=footer_note,
         )
         await interaction.followup.send(embed=view.create_embed(), view=view, ephemeral=True)
 
@@ -3738,6 +5224,50 @@ class LeaderboardCog(commands.Cog):
                                 changed = True
                 if changed:
                     await self.save_active_fights_for(int(gid_s))
+            run_decay_sweep = False
+            if self._last_decay_sweep is None:
+                run_decay_sweep = True
+            else:
+                elapsed = (now - self._last_decay_sweep).total_seconds()
+                if elapsed >= INACTIVITY_DECAY_SWEEP_SECONDS:
+                    run_decay_sweep = True
+            if run_decay_sweep:
+                self._last_decay_sweep = now
+                for gid_s, cfg in list(self.guild_configs.items()):
+                    try:
+                        gid = int(gid_s)
+                    except Exception:
+                        continue
+                    board_cfgs = cfg.get("leaderboards", {}) if isinstance(cfg, dict) else {}
+                    board_names: List[str] = []
+                    if isinstance(board_cfgs, dict):
+                        for safe_name, board_payload in board_cfgs.items():
+                            if not isinstance(board_payload, dict):
+                                continue
+                            display_name = str(board_payload.get("name") or safe_name).strip()
+                            if display_name:
+                                board_names.append(display_name)
+                    if not board_names:
+                        board_names = self.list_leaderboards(gid)
+                    board_names = [name for name in dict.fromkeys(board_names) if name]
+                    for board_name in board_names:
+                        try:
+                            decay_result = await self.apply_inactivity_decay_for_board(gid, board_name, now=now)
+                        except Exception:
+                            logger.exception(
+                                "Failed inactivity decay sweep for guild %s board %s",
+                                gid,
+                                board_name,
+                            )
+                            continue
+                        if decay_result.get("changed_players", 0) > 0:
+                            logger.info(
+                                "Inactivity decay applied for guild %s board %s: %s players, %.1f total Elo",
+                                gid,
+                                board_name,
+                                decay_result.get("changed_players", 0),
+                                float(decay_result.get("total_decay", 0.0)),
+                            )
             await asyncio.sleep(0)
 
     @commands.Cog.listener()
@@ -3822,6 +5352,28 @@ class LeaderboardCog(commands.Cog):
         if self._cleanup_task is None:
             self._cleanup_task = self.client.loop.create_task(self._deletion_loop())
         restored = 0
+        restored_leaderboards = 0
+        for gid_s, cfg in list(self.guild_configs.items()):
+            try:
+                gid = int(gid_s)
+            except Exception:
+                continue
+            boards = cfg.get("leaderboards", {}) if isinstance(cfg, dict) else {}
+            if not isinstance(boards, dict):
+                continue
+            for safe_name, board_cfg in boards.items():
+                if not isinstance(board_cfg, dict):
+                    continue
+                message_id = board_cfg.get("leaderboard_message_id")
+                if not message_id:
+                    continue
+                board_name = board_cfg.get("name", safe_name.replace("_", " ").title())
+                try:
+                    view = self.build_leaderboard_view(gid, board_name)
+                    self.client.add_view(view, message_id=int(message_id))
+                    restored_leaderboards += 1
+                except Exception:
+                    logger.debug("Failed to restore leaderboard view for guild %s board %s", gid_s, board_name)
         for gid_s, cat_map in list(self.active_fights.items()):
             try:
                 gid = int(gid_s)
@@ -3841,6 +5393,8 @@ class LeaderboardCog(commands.Cog):
                     except Exception:
                         logger.debug("Failed to restore view for guild %s match %s", gid_s, match_id)
                     match.pop("thread_message_id", None)
+        if restored_leaderboards:
+            logger.info("Restored %s leaderboard controls after reconnect.", restored_leaderboards)
         if restored:
             logger.info("Restored %s challenge controls after reconnect.", restored)
 

@@ -14,6 +14,7 @@ DB_FILE = os.path.join(DATA_DIR, "bapnboard.sqlite3")
 TZ = ZoneInfo("America/New_York")
 DEFAULT_START_ELO = 800.0
 GLOBAL_BIO_KEY = "__global"
+GLOBAL_BAN_SCOPE = "__all__"
 PENDING_CHALLENGE_TIMEOUT = timedelta(hours=6)
 
 logger = logging.getLogger("bapnboard")

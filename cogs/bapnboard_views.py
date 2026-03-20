@@ -37,8 +37,9 @@ class PagedListView(discord.ui.View):
         header: Optional[str] = None,
         client_side_only: bool = False,
         owner_id: Optional[int] = None,
+        timeout: Optional[float] = None,
     ):
-        super().__init__(timeout=None)
+        super().__init__(timeout=timeout)
         self.title = title
         self.pages = pages if pages else [["No entries."]]
         self.color = color
@@ -96,6 +97,7 @@ class PagedListView(discord.ui.View):
             header=self.header,
             client_side_only=False,
             owner_id=interaction.user.id,
+            timeout=600,
         )
         private_view.current = index
         private_view._sync_buttons()

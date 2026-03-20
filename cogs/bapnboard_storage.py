@@ -4,7 +4,7 @@ import sqlite3
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-from .bapnboard_shared import DB_FILE, GLOBAL_BIO_KEY, normalize_category
+from .bapnboard_shared import DB_FILE, GLOBAL_BAN_SCOPE, GLOBAL_BIO_KEY, normalize_category
 
 
 class BoardStorage:
@@ -13,11 +13,41 @@ class BoardStorage:
         self._lock = threading.Lock()
         self._ensure_schema()
 
+    @staticmethod
+    def _is_player_bans_schema_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "malformed database schema" in text and "player_bans" in text
+
+    def _repair_player_bans_schema(self, conn: sqlite3.Connection) -> None:
+        # Best-effort repair for a broken sqlite_schema entry introduced around player_bans.
+        # We only touch the player_bans table and its indexes.
+        conn.executescript(
+            """
+            PRAGMA writable_schema=ON;
+            DELETE FROM sqlite_master WHERE type='index' AND name='idx_player_bans_user';
+            DELETE FROM sqlite_master WHERE type='index' AND name='sqlite_autoindex_player_bans_1';
+            DELETE FROM sqlite_master WHERE type='table' AND name='player_bans';
+            PRAGMA writable_schema=OFF;
+            """
+        )
+        row = conn.execute("PRAGMA schema_version").fetchone()
+        current_version = int(row[0]) if row else 0
+        conn.execute(f"PRAGMA schema_version={current_version + 1}")
+        conn.commit()
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+        except sqlite3.DatabaseError as exc:
+            if not self._is_player_bans_schema_error(exc):
+                conn.close()
+                raise
+            self._repair_player_bans_schema(conn)
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
         return conn
 
     def _ensure_schema(self) -> None:
@@ -46,6 +76,10 @@ class BoardStorage:
                     leaderboard_message_id INTEGER,
                     pending_timeout_enabled INTEGER DEFAULT 1,
                     anti_farm_enabled INTEGER DEFAULT 1,
+                    inactivity_decay_enabled INTEGER DEFAULT 1,
+                    inactivity_decay_days INTEGER DEFAULT 7,
+                    inactivity_decay_amount REAL DEFAULT 10.0,
+                    inactivity_decay_floor REAL DEFAULT 800.0,
                     thread_cleanup_seconds INTEGER DEFAULT 21600,
                     PRIMARY KEY (guild_id, category)
                 );
@@ -86,6 +120,16 @@ class BoardStorage:
                     losses INTEGER NOT NULL,
                     PRIMARY KEY (guild_id, category, user_id)
                 );
+                CREATE TABLE IF NOT EXISTS player_bans (
+                    guild_id INTEGER NOT NULL,
+                    scope_category TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    reason TEXT,
+                    banned_by INTEGER,
+                    banned_at TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, scope_category, user_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_player_bans_user ON player_bans (guild_id, user_id);
                 CREATE TABLE IF NOT EXISTS bios (
                     guild_id INTEGER NOT NULL,
                     category TEXT NOT NULL,
@@ -177,8 +221,20 @@ class BoardStorage:
                     delete_at TEXT NOT NULL,
                     PRIMARY KEY (guild_id, category, thread_id)
                 );
+                CREATE TABLE IF NOT EXISTS player_decay (
+                    guild_id INTEGER NOT NULL,
+                    category TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    last_decay_at TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, category, user_id)
+                );
                 """
             )
+            # Best-effort index rebuild for history lookups.
+            try:
+                conn.execute("REINDEX idx_matches_lookup")
+            except sqlite3.DatabaseError:
+                pass
             try:
                 conn.execute("ALTER TABLE active_matches ADD COLUMN thread_message_id INTEGER")
             except sqlite3.OperationalError:
@@ -189,6 +245,22 @@ class BoardStorage:
                 pass
             try:
                 conn.execute("ALTER TABLE leaderboards ADD COLUMN anti_farm_enabled INTEGER DEFAULT 1")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE leaderboards ADD COLUMN inactivity_decay_enabled INTEGER DEFAULT 1")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE leaderboards ADD COLUMN inactivity_decay_days INTEGER DEFAULT 7")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE leaderboards ADD COLUMN inactivity_decay_amount REAL DEFAULT 10.0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE leaderboards ADD COLUMN inactivity_decay_floor REAL DEFAULT 800.0")
             except sqlite3.OperationalError:
                 pass
     def _ensure_guild_entry(self, target: Dict[str, Dict[str, Any]], gid_s: str) -> Dict[str, Any]:
@@ -213,6 +285,8 @@ class BoardStorage:
                 players: Dict[str, Dict[str, Dict[int, Dict[str, Any]]]] = {}
                 players_meta: Dict[str, Dict[str, Dict[str, Any]]] = {}
                 removed: Dict[str, Dict[str, Dict[int, Dict[str, Any]]]] = {}
+                bans: Dict[str, Dict[str, Dict[int, Dict[str, Any]]]] = {}
+                decay_state: Dict[str, Dict[str, Dict[int, str]]] = {}
                 bios: Dict[str, Dict[str, Dict[str, str]]] = {}
                 active_fights: Dict[str, Dict[str, Dict[str, Any]]] = {}
                 for row in conn.execute("SELECT * FROM guild_settings"):
@@ -246,6 +320,10 @@ class BoardStorage:
                         "leaderboard_message_id": row["leaderboard_message_id"],
                         "pending_timeout_enabled": bool(row["pending_timeout_enabled"]) if "pending_timeout_enabled" in row_keys else True,
                         "anti_farm_enabled": bool(row["anti_farm_enabled"]) if "anti_farm_enabled" in row_keys else True,
+                        "inactivity_decay_enabled": bool(row["inactivity_decay_enabled"]) if "inactivity_decay_enabled" in row_keys else True,
+                        "inactivity_decay_days": int(row["inactivity_decay_days"]) if "inactivity_decay_days" in row_keys and row["inactivity_decay_days"] is not None else 7,
+                        "inactivity_decay_amount": float(row["inactivity_decay_amount"]) if "inactivity_decay_amount" in row_keys and row["inactivity_decay_amount"] is not None else 10.0,
+                        "inactivity_decay_floor": float(row["inactivity_decay_floor"]) if "inactivity_decay_floor" in row_keys and row["inactivity_decay_floor"] is not None else 800.0,
                         "thread_cleanup_seconds": row["thread_cleanup_seconds"] or data.get("thread_cleanup_seconds", 21600),
                     }
                     data["leaderboards"][safe] = entry
@@ -281,6 +359,18 @@ class BoardStorage:
                         "wins": row["wins"],
                         "losses": row["losses"],
                     }
+                for row in conn.execute("SELECT guild_id, scope_category, user_id, reason, banned_by, banned_at FROM player_bans"):
+                    gid_s = str(row["guild_id"])
+                    scope = row["scope_category"] or GLOBAL_BAN_SCOPE
+                    bans.setdefault(gid_s, {}).setdefault(scope, {})[row["user_id"]] = {
+                        "reason": row["reason"],
+                        "banned_by": row["banned_by"],
+                        "banned_at": row["banned_at"],
+                    }
+                for row in conn.execute("SELECT guild_id, category, user_id, last_decay_at FROM player_decay"):
+                    gid_s = str(row["guild_id"])
+                    safe = row["category"]
+                    decay_state.setdefault(gid_s, {}).setdefault(safe, {})[row["user_id"]] = row["last_decay_at"]
                 for row in conn.execute("SELECT guild_id, category, user_id, bio FROM bios"):
                     gid_s = str(row["guild_id"])
                     bios.setdefault(gid_s, {}).setdefault(row["category"], {})[str(row["user_id"])] = row["bio"]
@@ -358,6 +448,8 @@ class BoardStorage:
                     "players": players,
                     "players_meta": players_meta,
                     "removed": removed,
+                    "bans": bans,
+                    "decay_state": decay_state,
                     "bios": bios,
                     "active_fights": active_fights,
                 }
@@ -430,9 +522,13 @@ class BoardStorage:
                                 leaderboard_message_id,
                                 pending_timeout_enabled,
                                 anti_farm_enabled,
+                                inactivity_decay_enabled,
+                                inactivity_decay_days,
+                                inactivity_decay_amount,
+                                inactivity_decay_floor,
                                 thread_cleanup_seconds
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 gid,
@@ -446,6 +542,10 @@ class BoardStorage:
                                 board.get("leaderboard_message_id"),
                                 1 if board.get("pending_timeout_enabled", True) else 0,
                                 1 if board.get("anti_farm_enabled", True) else 0,
+                                1 if board.get("inactivity_decay_enabled", True) else 0,
+                                max(1, int(board.get("inactivity_decay_days", 7))),
+                                max(0.0, float(board.get("inactivity_decay_amount", 10.0))),
+                                max(0.0, float(board.get("inactivity_decay_floor", 800.0))),
                                 board.get("thread_cleanup_seconds", payload.get("thread_cleanup_seconds", 21600)),
                             ),
                         )
@@ -557,6 +657,71 @@ class BoardStorage:
                         ),
                     )
 
+    def save_bans(self, guild_id: int, bans_map: Dict[str, Dict[int, Dict[str, Any]]]) -> None:
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM player_bans WHERE guild_id=?", (guild_id,))
+                for raw_scope, users in bans_map.items():
+                    if not isinstance(users, dict):
+                        continue
+                    scope = (
+                        GLOBAL_BAN_SCOPE
+                        if str(raw_scope) == GLOBAL_BAN_SCOPE
+                        else normalize_category(str(raw_scope))
+                    )
+                    for raw_user_id, payload in users.items():
+                        if not isinstance(payload, dict):
+                            payload = {}
+                        try:
+                            user_id = int(raw_user_id)
+                        except Exception:
+                            continue
+                        banned_at = payload.get("banned_at")
+                        if not banned_at:
+                            continue
+                        banned_by = payload.get("banned_by")
+                        try:
+                            banned_by_value = int(banned_by) if banned_by is not None else None
+                        except Exception:
+                            banned_by_value = None
+                        cur.execute(
+                            """
+                            INSERT INTO player_bans (guild_id, scope_category, user_id, reason, banned_by, banned_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                guild_id,
+                                scope,
+                                user_id,
+                                payload.get("reason"),
+                                banned_by_value,
+                                str(banned_at),
+                            ),
+                        )
+
+    def save_decay_state(self, guild_id: int, category: str, decay_map: Dict[int, str]) -> None:
+        safe = normalize_category(category)
+        with self._lock:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM player_decay WHERE guild_id=? AND category=?", (guild_id, safe))
+                for raw_user_id, raw_marker in decay_map.items():
+                    try:
+                        user_id = int(raw_user_id)
+                    except Exception:
+                        continue
+                    marker = str(raw_marker or "").strip()
+                    if not marker:
+                        continue
+                    cur.execute(
+                        """
+                        INSERT INTO player_decay (guild_id, category, user_id, last_decay_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (guild_id, safe, user_id, marker),
+                    )
+
     def save_bios(self, guild_id: int, category: str, bios_map: Dict[str, str]) -> None:
         safe = normalize_category(category)
         with self._lock:
@@ -623,6 +788,215 @@ class BoardStorage:
                 )
                 return int(cur.lastrowid)
 
+    def audit_completed_history_integrity(
+        self,
+        guild_id: int,
+        category: str,
+        sample_limit: int = 3,
+    ) -> Dict[str, Any]:
+        safe = normalize_category(category)
+        limit = max(1, int(sample_limit))
+        with self._lock:
+            with self._connect() as conn:
+                win_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS c
+                        FROM matches NOT INDEXED
+                        WHERE guild_id=?
+                          AND category=?
+                          AND result IN ('Win', 'DeclineWin')
+                        """,
+                        (guild_id, safe),
+                    ).fetchone()["c"]
+                )
+                loss_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS c
+                        FROM matches NOT INDEXED
+                        WHERE guild_id=?
+                          AND category=?
+                          AND result='Loss'
+                        """,
+                        (guild_id, safe),
+                    ).fetchone()["c"]
+                )
+
+                missing_loss_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS c
+                        FROM matches w NOT INDEXED
+                        WHERE w.guild_id=?
+                          AND w.category=?
+                          AND w.result IN ('Win', 'DeclineWin')
+                          AND NOT EXISTS (
+                                SELECT 1
+                                FROM matches l NOT INDEXED
+                                WHERE l.guild_id=w.guild_id
+                                  AND l.category=w.category
+                                  AND l.recorded_at=w.recorded_at
+                                  AND l.user_id=w.opponent_id
+                                  AND l.opponent_id=w.user_id
+                                  AND l.result='Loss'
+                          )
+                        """,
+                        (guild_id, safe),
+                    ).fetchone()["c"]
+                )
+                missing_win_count = int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) AS c
+                        FROM matches l NOT INDEXED
+                        WHERE l.guild_id=?
+                          AND l.category=?
+                          AND l.result='Loss'
+                          AND NOT EXISTS (
+                                SELECT 1
+                                FROM matches w NOT INDEXED
+                                WHERE w.guild_id=l.guild_id
+                                  AND w.category=l.category
+                                  AND w.recorded_at=l.recorded_at
+                                  AND w.user_id=l.opponent_id
+                                  AND w.opponent_id=l.user_id
+                                  AND w.result IN ('Win', 'DeclineWin')
+                          )
+                        """,
+                        (guild_id, safe),
+                    ).fetchone()["c"]
+                )
+
+                missing_loss_samples: List[Dict[str, Any]] = []
+                for row in conn.execute(
+                    """
+                    SELECT id, recorded_at, user_id, opponent_id, user_value, opponent_value, result
+                    FROM matches w NOT INDEXED
+                    WHERE w.guild_id=?
+                      AND w.category=?
+                      AND w.result IN ('Win', 'DeclineWin')
+                      AND NOT EXISTS (
+                            SELECT 1
+                            FROM matches l NOT INDEXED
+                            WHERE l.guild_id=w.guild_id
+                              AND l.category=w.category
+                              AND l.recorded_at=w.recorded_at
+                              AND l.user_id=w.opponent_id
+                              AND l.opponent_id=w.user_id
+                              AND l.result='Loss'
+                      )
+                    ORDER BY w.recorded_at DESC, w.id DESC
+                    LIMIT ?
+                    """,
+                    (guild_id, safe, limit),
+                ):
+                    missing_loss_samples.append(
+                        {
+                            "id": int(row["id"]),
+                            "recorded_at": row["recorded_at"],
+                            "user_id": int(row["user_id"]),
+                            "opponent_id": int(row["opponent_id"]),
+                            "user_value": row["user_value"],
+                            "opponent_value": row["opponent_value"],
+                            "result": row["result"],
+                        }
+                    )
+
+                missing_win_samples: List[Dict[str, Any]] = []
+                for row in conn.execute(
+                    """
+                    SELECT id, recorded_at, user_id, opponent_id, user_value, opponent_value, result
+                    FROM matches l NOT INDEXED
+                    WHERE l.guild_id=?
+                      AND l.category=?
+                      AND l.result='Loss'
+                      AND NOT EXISTS (
+                            SELECT 1
+                            FROM matches w NOT INDEXED
+                            WHERE w.guild_id=l.guild_id
+                              AND w.category=l.category
+                              AND w.recorded_at=l.recorded_at
+                              AND w.user_id=l.opponent_id
+                              AND w.opponent_id=l.user_id
+                              AND w.result IN ('Win', 'DeclineWin')
+                      )
+                    ORDER BY l.recorded_at DESC, l.id DESC
+                    LIMIT ?
+                    """,
+                    (guild_id, safe, limit),
+                ):
+                    missing_win_samples.append(
+                        {
+                            "id": int(row["id"]),
+                            "recorded_at": row["recorded_at"],
+                            "user_id": int(row["user_id"]),
+                            "opponent_id": int(row["opponent_id"]),
+                            "user_value": row["user_value"],
+                            "opponent_value": row["opponent_value"],
+                            "result": row["result"],
+                        }
+                    )
+
+                orphan_announcement_count = 0
+                orphan_announcement_samples: List[int] = []
+                try:
+                    orphan_announcement_count = int(
+                        conn.execute(
+                            """
+                            SELECT COUNT(*) AS c
+                            FROM match_announcements a
+                            LEFT JOIN matches w
+                              ON w.guild_id=a.guild_id
+                             AND w.category=a.category
+                             AND w.id=a.winner_match_id
+                             AND w.result IN ('Win', 'DeclineWin')
+                            WHERE a.guild_id=?
+                              AND a.category=?
+                              AND w.id IS NULL
+                            """,
+                            (guild_id, safe),
+                        ).fetchone()["c"]
+                    )
+                    for row in conn.execute(
+                        """
+                        SELECT a.winner_match_id
+                        FROM match_announcements a
+                        LEFT JOIN matches w
+                          ON w.guild_id=a.guild_id
+                         AND w.category=a.category
+                         AND w.id=a.winner_match_id
+                         AND w.result IN ('Win', 'DeclineWin')
+                        WHERE a.guild_id=?
+                          AND a.category=?
+                          AND w.id IS NULL
+                        ORDER BY a.winner_match_id DESC
+                        LIMIT ?
+                        """,
+                        (guild_id, safe, limit),
+                    ):
+                        orphan_announcement_samples.append(int(row["winner_match_id"]))
+                except sqlite3.OperationalError:
+                    orphan_announcement_count = 0
+                    orphan_announcement_samples = []
+
+                has_issues = (
+                    missing_loss_count > 0
+                    or missing_win_count > 0
+                    or orphan_announcement_count > 0
+                )
+                return {
+                    "has_issues": has_issues,
+                    "wins": win_count,
+                    "losses": loss_count,
+                    "missing_loss_count": missing_loss_count,
+                    "missing_win_count": missing_win_count,
+                    "orphan_announcement_count": orphan_announcement_count,
+                    "missing_loss_samples": missing_loss_samples,
+                    "missing_win_samples": missing_win_samples,
+                    "orphan_announcement_samples": orphan_announcement_samples,
+                }
+
     def load_raw_match_rows(self, guild_id: int, category: str) -> List[Dict[str, Any]]:
         safe = normalize_category(category)
         with self._lock:
@@ -630,7 +1004,7 @@ class BoardStorage:
                 rows = conn.execute(
                     """
                     SELECT id, user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
-                    FROM matches
+                    FROM matches NOT INDEXED
                     WHERE guild_id=? AND category=?
                     ORDER BY recorded_at ASC, id ASC
                     """,
@@ -672,8 +1046,8 @@ class BoardStorage:
                         w.opponent_id AS loser_id,
                         w.user_value AS winner_value,
                         w.opponent_value AS loser_value
-                    FROM matches w
-                    JOIN matches l
+                    FROM matches w NOT INDEXED
+                    JOIN matches l NOT INDEXED
                       ON l.guild_id = w.guild_id
                      AND l.category = w.category
                      AND l.recorded_at = w.recorded_at
@@ -682,7 +1056,7 @@ class BoardStorage:
                      AND l.result = 'Loss'
                     WHERE w.guild_id=?
                       AND w.category=?
-                      AND w.result='Win'
+                      AND w.result IN ('Win', 'DeclineWin')
                     ORDER BY w.recorded_at DESC, w.id DESC
                     LIMIT ?
                     """,
@@ -716,12 +1090,12 @@ class BoardStorage:
                 rows = conn.execute(
                     """
                     SELECT opponent_id
-                    FROM matches
+                    FROM matches NOT INDEXED
                     WHERE guild_id=?
                       AND category=?
                       AND user_id=?
                       AND challenger=1
-                      AND result IN ('Win', 'Loss')
+                      AND result IN ('Win', 'DeclineWin', 'Loss')
                     ORDER BY recorded_at DESC, id DESC
                     LIMIT ?
                     """,
@@ -747,25 +1121,43 @@ class BoardStorage:
                     """
                     SELECT
                         w.id AS winner_match_id,
-                        l.id AS loser_match_id,
+                        (
+                            SELECT l.id
+                            FROM matches l NOT INDEXED
+                            WHERE l.guild_id = w.guild_id
+                              AND l.category = w.category
+                              AND l.recorded_at = w.recorded_at
+                              AND l.user_id = w.opponent_id
+                              AND l.opponent_id = w.user_id
+                              AND l.result = 'Loss'
+                            ORDER BY l.id ASC
+                            LIMIT 1
+                        ) AS loser_match_id,
                         w.recorded_at AS recorded_at,
                         w.user_id AS winner_id,
                         w.opponent_id AS loser_id,
                         w.user_value AS winner_value,
                         w.opponent_value AS loser_value,
                         w.elo_change AS winner_elo_change,
-                        l.elo_change AS loser_elo_change
-                    FROM matches w
-                    JOIN matches l
-                      ON l.guild_id = w.guild_id
-                     AND l.category = w.category
-                     AND l.recorded_at = w.recorded_at
-                     AND l.user_id = w.opponent_id
-                     AND l.opponent_id = w.user_id
-                     AND l.result = 'Loss'
+                        COALESCE(
+                            (
+                                SELECT l.elo_change
+                                FROM matches l NOT INDEXED
+                                WHERE l.guild_id = w.guild_id
+                                  AND l.category = w.category
+                                  AND l.recorded_at = w.recorded_at
+                                  AND l.user_id = w.opponent_id
+                                  AND l.opponent_id = w.user_id
+                                  AND l.result = 'Loss'
+                                ORDER BY l.id ASC
+                                LIMIT 1
+                            ),
+                            -w.elo_change
+                        ) AS loser_elo_change
+                    FROM matches w NOT INDEXED
                     WHERE w.guild_id=?
                       AND w.category=?
-                      AND w.result='Win'
+                      AND w.result IN ('Win', 'DeclineWin')
                       AND (
                             (w.user_id=? AND w.opponent_id=?)
                             OR
@@ -778,10 +1170,11 @@ class BoardStorage:
                 )
                 output: List[Dict[str, Any]] = []
                 for row in rows:
+                    loser_match_id = row["loser_match_id"]
                     output.append(
                         {
                             "winner_match_id": int(row["winner_match_id"]),
-                            "loser_match_id": int(row["loser_match_id"]),
+                            "loser_match_id": int(loser_match_id) if loser_match_id is not None else None,
                             "recorded_at": row["recorded_at"],
                             "winner_id": int(row["winner_id"]),
                             "loser_id": int(row["loser_id"]),
@@ -805,7 +1198,7 @@ class BoardStorage:
                 winner_row = conn.execute(
                     """
                     SELECT id, user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
-                    FROM matches
+                    FROM matches NOT INDEXED
                     WHERE guild_id=? AND category=? AND id=? AND result='Win'
                     """,
                     (guild_id, safe, int(winner_row_id)),
@@ -815,7 +1208,7 @@ class BoardStorage:
                 loser_row = conn.execute(
                     """
                     SELECT id, user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
-                    FROM matches
+                    FROM matches NOT INDEXED
                     WHERE guild_id=?
                       AND category=?
                       AND recorded_at=?
@@ -872,7 +1265,7 @@ class BoardStorage:
                 winner_row = conn.execute(
                     """
                     SELECT id, user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
-                    FROM matches
+                    FROM matches NOT INDEXED
                     WHERE guild_id=? AND category=? AND id=? AND result='Win'
                     """,
                     (guild_id, safe, int(winner_row_id)),
@@ -882,7 +1275,7 @@ class BoardStorage:
                 loser_row = conn.execute(
                     """
                     SELECT id, user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
-                    FROM matches
+                    FROM matches NOT INDEXED
                     WHERE guild_id=?
                       AND category=?
                       AND recorded_at=?
@@ -1021,7 +1414,7 @@ class BoardStorage:
                 rows = conn.execute(
                     """
                     SELECT user_id, recorded_at, opponent_id, challenger, user_value, opponent_value, result, elo_change
-                    FROM matches
+                    FROM matches NOT INDEXED
                     WHERE guild_id=? AND category=?
                     ORDER BY recorded_at ASC, id ASC
                     """,
@@ -1048,7 +1441,7 @@ class BoardStorage:
         with self._lock:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT COUNT(*) AS c FROM matches WHERE guild_id=? AND category=? AND user_id=?",
+                    "SELECT COUNT(*) AS c FROM matches NOT INDEXED WHERE guild_id=? AND category=? AND user_id=?",
                     (guild_id, safe, member_id),
                 ).fetchone()
                 return int(row["c"] if row else 0)
@@ -1234,6 +1627,14 @@ class BoardStorage:
                     (new_safe, guild_id, old_safe),
                 )
                 cur.execute(
+                    "UPDATE player_bans SET scope_category=? WHERE guild_id=? AND scope_category=?",
+                    (new_safe, guild_id, old_safe),
+                )
+                cur.execute(
+                    "UPDATE player_decay SET category=? WHERE guild_id=? AND category=?",
+                    (new_safe, guild_id, old_safe),
+                )
+                cur.execute(
                     "UPDATE bios SET category=? WHERE guild_id=? AND category=?",
                     (new_safe, guild_id, old_safe),
                 )
@@ -1277,6 +1678,14 @@ class BoardStorage:
                 )
                 cur.execute(
                     "DELETE FROM removed_players WHERE guild_id=? AND category=?",
+                    (guild_id, safe),
+                )
+                cur.execute(
+                    "DELETE FROM player_bans WHERE guild_id=? AND scope_category=?",
+                    (guild_id, safe),
+                )
+                cur.execute(
+                    "DELETE FROM player_decay WHERE guild_id=? AND category=?",
                     (guild_id, safe),
                 )
                 cur.execute(
@@ -1331,12 +1740,24 @@ class BoardStorage:
                 for row in conn.execute("SELECT DISTINCT category FROM players WHERE guild_id=?", (guild_id,)):
                     value = self._display_from_safe(row["category"])
                     names.setdefault(value.lower(), value)
-                for row in conn.execute("SELECT DISTINCT category FROM matches WHERE guild_id=?", (guild_id,)):
+                for row in conn.execute("SELECT DISTINCT category FROM matches NOT INDEXED WHERE guild_id=?", (guild_id,)):
                     value = self._display_from_safe(row["category"])
                     names.setdefault(value.lower(), value)
                 for row in conn.execute("SELECT DISTINCT category FROM removed_players WHERE guild_id=?", (guild_id,)):
                     safe = row["category"]
                     if safe == GLOBAL_BIO_KEY:
+                        continue
+                    value = self._display_from_safe(safe)
+                    names.setdefault(value.lower(), value)
+                for row in conn.execute("SELECT DISTINCT scope_category FROM player_bans WHERE guild_id=?", (guild_id,)):
+                    safe = row["scope_category"]
+                    if safe in {GLOBAL_BIO_KEY, GLOBAL_BAN_SCOPE}:
+                        continue
+                    value = self._display_from_safe(safe)
+                    names.setdefault(value.lower(), value)
+                for row in conn.execute("SELECT DISTINCT category FROM player_decay WHERE guild_id=?", (guild_id,)):
+                    safe = row["category"]
+                    if not safe:
                         continue
                     value = self._display_from_safe(safe)
                     names.setdefault(value.lower(), value)
